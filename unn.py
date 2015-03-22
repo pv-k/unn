@@ -1,3 +1,27 @@
+"""Copyright (c) 2015, Pavel Kalinin
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * The names of the contributors may not be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."""
+
 import argparse
 import sys
 import pickle
@@ -333,6 +357,8 @@ class Trainer(object):
                 lr.set_value(lr.get_value() / numpy.float32(2.0))
                 print "New learning rate set {}. Interrupts remaining: {}".format(lr.get_value(), interrupts_budget)
 
+# ------------------------------apply---------------------------------------
+
 def apply_model(model, dataset, output_stream):
     input_vars = {var.name: var for var in flatten(model.get_inputs())}
     transformers_map = {var.name: var.transformer for var in input_vars.values() if
@@ -361,8 +387,34 @@ def apply_model(model, dataset, output_stream):
         output_stream.write("\n".join(("\t".join(str(val) for val in vals)) for vals in output) + "\n")
 
 # -----------------------------------modules-----------------------
+class Variable(object):
+    def __init__(self, type, num_features=None, producer=None, name=None,
+            transformer=None):
+        self.producer = producer
+        self.name = name
+        self.type = type
+        self.num_features = num_features
+        self.transformer = transformer
 
-# efficient sparse dot
+class Module(object):
+    def __init__(self, input_vars, output_var):
+        self.input_vars = input_vars
+        self.output = output_var
+        self.output.producer = self
+    def train_fprop(self, inputs):
+        raise NotImplementedError()
+    def fprop(self, inputs):
+        return self.train_fprop(inputs)[0]
+    def get_params(self):
+        return []
+    def get_penalized_params(self):
+        return []
+    def get_inputs(self):
+        return self.input_vars
+    def get_output(self):
+        return self.output
+
+# efficient sparse dot for affine module
 @as_op(itypes=[T.ivector],
        otypes=[T.ivector])
 def range_len(e):
@@ -393,33 +445,6 @@ def sparse_dot(X, W, W_numrows=None):
     res = theano.sparse.structured_dot(newX, compactW)
     return SparseDotParams(res, W, compactW, nonzeroes)
 
-class Variable(object):
-    def __init__(self, type, num_features=None, producer=None, name=None,
-            transformer=None):
-        self.producer = producer
-        self.name = name
-        self.type = type
-        self.num_features = num_features
-        self.transformer = transformer
-
-class Module(object):
-    def __init__(self, input_vars, output_var):
-        self.input_vars = input_vars
-        self.output = output_var
-        self.output.producer = self
-    def train_fprop(self, inputs):
-        raise NotImplementedError()
-    def fprop(self, inputs):
-        return self.train_fprop(inputs)[0]
-    def get_params(self):
-        return []
-    def get_penalized_params(self):
-        return []
-    def get_inputs(self):
-        return self.input_vars
-    def get_output(self):
-        return self.output
-
 class AffineModule(Module):
     def __init__(self, rng, input_var, num_outputs, output_activation_name=None):
         Module.__init__(self, [input_var], Variable("dense", num_outputs, self))
@@ -432,10 +457,8 @@ class AffineModule(Module):
         self.output_activation_name = output_activation_name
 
         expected_input_size = 50 if input_var.type == "sparse" else input_var.num_features
-        if output_activation_name is None or output_activation_name == "tanh" or\
-                 output_activation_name == "linear":
-            bound = numpy.sqrt(6. / (expected_input_size + num_outputs))
-        elif output_activation_name == "sigmoid":
+        bound = numpy.sqrt(6. / (expected_input_size + num_outputs))
+        if output_activation_name == "sigmoid":
             bound = 4 * numpy.sqrt(6. / (expected_input_size + num_outputs))
         elif output_activation_name == "rlu":
             bound = numpy.sqrt(2. / expected_input_size)
@@ -548,6 +571,25 @@ def tanh(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(TanhModule(input_variable))
     return modules
+class SignedSqrtModule(Module):
+    def __init__(self, input):
+        Module.__init__(self, [input], Variable("dense", input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        var = inputs[0]
+        return T.sgn(var) * T.sqrt(abs(var)), [], []
+def signed_sqrt(rng, input_variable, num_outputs=None):
+    if not isinstance(input_variable, Variable):
+        raise Exception("Unknown input: " + str(input_variable))
+    modules = []
+    if num_outputs is not None:
+        num_outputs = int(num_outputs)
+        modules.append(AffineModule(rng, input_variable,
+            num_outputs, "signed_sqrt"))
+        input_variable = modules[-1].get_output()
+    modules.append(SignedSqrtModule(input_variable))
+    return modules
+
 def linear(rng, input_variable, num_outputs):
     if not isinstance(input_variable, Variable):
         raise Exception("Unknown input: " + str(input_variable))
@@ -605,6 +647,21 @@ def scale(*inputs):
         raise Exception("Cannot parse scalin constat as float")
     return [ScaleModule(inputs[0], float(inputs[1]))]
 
+class SubModule(Module):
+    def __init__(self, inputs):
+        num_output_features = 1
+        Module.__init__(self, inputs, Variable("dense", num_output_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 2
+        return inputs[0] - inputs[1], [], []
+def sub(*inputs):
+    if len(inputs) != 2:
+        raise Exception("Wrong number of inputs to dot: {}. Should be 2".format(len(inputs)))
+    for input in inputs:
+        if not isinstance(input, Variable):
+            raise Exception("Unknown input: " + str(input))
+    return [SubModule(inputs)]
+
 class MseEnergy(Module):
     def __init__(self, model, transformer=None):
         inputs = (model.get_inputs(), Variable("dense", name="targets",
@@ -642,7 +699,7 @@ class CrossEntropyEnergy(Module):
         targets = inputs[1]
         weights = inputs[2]
         return -T.sum(weights * (targets * T.log(model_output + numpy.float32(1e-10)) +
-            (numpy.float32(1) - targets) * T.log((numpy.float32(1.0000001) - model_output) + numpy.float32(1e-10)))) / T.sum(abs(weights)), \
+            (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - model_output))) / T.sum(abs(weights)), \
             model_dynamic_params, model_dynamic_penalized_params
     def fprop(self, inputs):
         model_inputs = inputs[0]
@@ -650,7 +707,7 @@ class CrossEntropyEnergy(Module):
         weights = inputs[2]
         model_output = self.model.fprop(model_inputs)
         return -T.sum(weights * (targets * T.log(model_output + numpy.float32(1e-10)) +
-            (numpy.float32(1) - targets) * T.log( (numpy.float32(1.0000001) - model_output) + numpy.float32(1e-10) ) )) / T.sum(abs(weights))
+            (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - model_output) )) / T.sum(abs(weights))
     def get_params(self):
         return self.model.get_params()
     def get_penalized_params(self):
@@ -669,10 +726,8 @@ class AccuracyEnergy(Module):
         weights = inputs[2]
 
         # this expression assumes that there is just one output with everything
-        #   above 0.5 positive (standard assumption for classification learning)
-        # if there are more outputs, there are more possible options. Nothing is currently implemented
-        #   directions: 1) assume that in multiple output case 1 of k encoding is used.
-        #   Thus the answer is the output with the maximum index
+        #   above 0.5 positive (common assumption for binary classification)
+        # if there are more outputs, there are more possible options - currently this is not implemented
         return T.sum(weights * (targets == (model_output > numpy.float32(0.5)))) / T.sum(abs(weights)), \
             model_dynamic_params, model_dynamic_penalized_params
     def fprop(self, inputs):
@@ -681,40 +736,6 @@ class AccuracyEnergy(Module):
         weights = inputs[2]
         model_output = self.model.fprop(model_inputs)
         return T.sum(weights * (targets == (model_output > numpy.float32(0.5)))) / T.sum(abs(weights))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
-
-class PairwiseModel(Module):
-    def __init__(self, model):
-        assert model.get_output().num_features == 1
-        self.model = model
-        left_inputs = []
-        right_inputs = []
-        self.inputs_names = set()
-        for input in flatten(self.model.get_inputs()):
-            left_input = copy.copy(input)
-            left_input.name = "left_" + input.name
-            left_inputs.append(left_input)
-            right_input = copy.copy(input)
-            right_input.name = "right_" + input.name
-            right_inputs.append(right_input)
-            self.inputs_names.add(left_input.name)
-            self.inputs_names.add(right_input.name)
-        inputs = (ravel(left_inputs, self.model.get_inputs()),
-            ravel(right_inputs, self.model.get_inputs()))
-        Module.__init__(self, inputs, Variable(type="dense", num_features=1))
-    def train_fprop(self, inputs):
-        left_output, left_dynamic_params, left_dynamic_penalized_params = self.model.train_fprop(inputs[0])
-        right_output, right_dynamic_params, right_dynamic_penalized_params = self.model.train_fprop(inputs[1])
-        return theano.tensor.nnet.sigmoid(left_output - right_output),\
-            left_dynamic_params + right_dynamic_params,\
-            left_dynamic_penalized_params + right_dynamic_penalized_params
-    def fprop(self, inputs):
-        left_output = self.model.fprop(inputs[0])
-        right_output = self.model.fprop(inputs[1])
-        return theano.tensor.nnet.sigmoid(left_output - right_output)
     def get_params(self):
         return self.model.get_params()
     def get_penalized_params(self):
@@ -748,6 +769,8 @@ class FuncModule(Module):
         intermediates = set()
         for module in toposorted_modules:
             for input in module.get_inputs():
+                if not isinstance(input, Variable):
+                    raise Exception("Incorrect input specified: {}".format(input))
                 if input not in intermediates:
                     assert input.name in inputs_map
             intermediates.add(module.get_output())
@@ -945,6 +968,10 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
             modules = dot(*inputs)
         elif func_name == "scale":
             modules = scale(*inputs)
+        elif func_name == "signed_sqrt":
+            modules = signed_sqrt(rng, *inputs)
+        elif func_name == "sub":
+            modules = sub(*inputs)
         else:
             raise Exception("Unknown function: {}".format(func_name))
         toposorted_modules.extend(modules)
@@ -1012,7 +1039,7 @@ class DenseMatrixBuilder(object):
         return self.array[:self.pos]
 
 # Weights in sgd are a problem. What if one sample is extremely important?
-# If samples are returned uniformly, this will lead to an extremely large
+# If samples are taken uniformly, this will lead to an extremely large
 # update when this sample finally appears that may destroy the model.
 # Here we solve this by sampling from the weights distribution.
 # Thus, learning may be slower, and the dataset is kept in memory
@@ -1023,7 +1050,9 @@ class RandomDatasetIterator(object):
             if var.name == "weights":
                 weights_pos =  idx
                 break
-        assert weights_pos >= 0
+        if (weights_pos < 0):
+            raise Exception("No weights in dataset")
+
         self.cumsum = numpy.cumsum(abs(dataset.arrays[weights_pos]) * 1.0 / sum(abs(dataset.arrays[weights_pos])))
         self.cumsum[-1] = 1
         self.num_batches = math.ceil(dataset.arrays[0].shape[0] * 1.0 / batch_size)
@@ -1130,27 +1159,22 @@ def get_transformer(transformer_name):
         return sklearn.preprocessing.MinMaxScaler()
     elif transformer_name == "pca":
         return sklearn.decomposition.PCA(whiten=True)
+    elif transformer_name == "none":
+        return None
     else:
         assert False
 
-def get_input_vars(inputs_specification, dataset_file, is_pairwise):
+def get_input_vars(inputs_specification, dataset_file):
     input_vars = []
     inputs_names = set()
     inputs_specs = inputs_specification.split(",")
     for spec in inputs_specs:
-        transformer = None
-        if "@" in spec:
-            entries = spec.split("@")
-            if len(entries) != 2:
-                raise Exception("Invalid input specification: multiple @ found for input {}".format(spec))
-            transform_name = entries[-1]
-            assert transform_name in ["pca", "scale", "minmax"]
-            transformer = get_transformer(transform_name)
-            spec = entries[0]
-        entries = spec.split(":")
-        assert 1 <= len(entries) and len(entries) <= 3
+        entries = spec.split("@")[0].split(":")
+        if len(entries) > 3:
+            raise Exception("Frong number of fields in input specification: {}. Should be: name[:type:num_features@transformer]".format(spec))
         name = entries[0]
-        assert name not in inputs_names
+        if name in inputs_names:
+            raise Exception("Duplicate input: " + name)
         inputs_names.add(name)
         type = None
         if len(entries) > 1:
@@ -1158,17 +1182,17 @@ def get_input_vars(inputs_specification, dataset_file, is_pairwise):
         num_features = None
         if len(entries) > 2:
             num_features = int(entries[2])
+
         input_vars.append(Variable(name=name, type=type,
-            num_features=num_features, transformer=transformer))
+            num_features=num_features, transformer=None))
 
     if dataset_file is not None:
         with open(dataset_file) as f:
             items = f.readline().split("\t")
-            if is_pairwise:
-                assert len(items) == 2 * len(input_vars) - 2
-            else:
-                assert len(items) == len(input_vars)
-            # if pairwise, the right inputs are not tested here
+            if len(items) != len(input_vars):
+                raise Exception("Number of inputs in {} is not equal to the number "
+                    "of inputs specified in the command line".format(dataset_file))
+
             for idx, (input_var, item) in enumerate(zip(input_vars, items)):
                 if item == "" or ":" in item:
                     if input_var.type is not None and input_var.type != "sparse":
@@ -1178,8 +1202,6 @@ def get_input_vars(inputs_specification, dataset_file, is_pairwise):
                     if input_var.num_features is None:
                         raise Exception("Number of features should be specified for "
                             "sparse input '{}'".format(input_var.name))
-                    assert input_var.num_features is not None
-                    assert input_var.transformer is None
                 else:
                     if input_var.type is not None and input_var.type != "dense":
                         raise Exception("The provided data type is inconsistent with "
@@ -1189,6 +1211,24 @@ def get_input_vars(inputs_specification, dataset_file, is_pairwise):
                         raise Exception("Number of features mismatch for input {}. Got {}, specified {}".format(
                             input_var.name, len(items.split(" ")), input_var.num_features))
                     input_var.num_features = len(item.split(" "))
+
+    for idx, var in enumerate(input_vars):
+        if "@" in inputs_specs[idx]:
+            entries = spec.split("@")
+            if len(entries) != 2:
+                raise Exception("Invalid input specification: multiple @ found for input {}".format(spec))
+            transform_name = entries[-1]
+            spec = entries[0]
+        else:
+            if var.type == "dense":
+                transform_name = "scale"
+            else:
+                transform_name = "none"
+        if transform_name not in ["none", "pca", "scale", "minmax"]:
+            raise Exception("Unknown transformer name: " + transform_name)
+        var.transformer = get_transformer(transform_name)
+        if var.type == "sparse" and var.transformer is not None:
+            raise Exception("Transformer cannot be used with a sparse input '{}'".format(input_var.name))
     return input_vars
 
 def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
@@ -1236,24 +1276,22 @@ def learn():
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
             "Names 'targets' and 'weights' are reserved."
             "Entry 'num_features' is optional for dense input. Entry 'type' for dense input is optional - it will be inferred from "
-            "the data. Entry 'preprocessor' (valid options: pca, scale, minmax. Default - none) is valid only for dense input")
+            "the data. Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - scale) is valid only for dense input")
 
     # unn architecture
     parser.add_argument("-a", "--architecture", help="architecture of the network. Format <func>|<func>|...|<func>"
         " where <func> can be <func_name>(<input_name>:<type>:<num_features>,...)=func_expression(input_name) (use this to create shared modules)"
         " or <output_name>=func_expression. The last <func> is model output")
-    parser.add_argument("--loss", choices=["mse", "cross_entropy", "pairwise"],
-        help="Loss function", default="mse")
-    parser.add_argument("--vloss", dest="validation_loss",
-        choices=["accuracy", "mse", "cross_entropy", "pairwise"],
-        help="Loss function. Currently accuracy supports just one output", default=None)
+    parser.add_argument("--loss", choices=["mse", "cross_entropy"], help="Loss function", default="mse")
+    parser.add_argument("--vloss", dest="validation_loss", choices=["accuracy", "mse", "cross_entropy"],
+        help="Validation loss (specify if you want it be different from train loss). Currently 'accuracy' supports just one output", default=None)
 
     # learning parameters
     parser.add_argument("--epochs", type=int, default=100,
-                        help="number of training epochs")
+                        help="Number of training epochs. Each epoch is one pass through the train dataset")
     parser.add_argument("--batch_size", type=int, default=30,
-                        help="batch size")
-    parser.add_argument("--lr", "--learning_rate", dest="learning_rate", type=float, default=0.01,
+                        help="Batch size")
+    parser.add_argument("--lr", "--learning_rate", dest="learning_rate", type=float, default=0.1,
                         help="learning rate")
     parser.add_argument("--momentum", type=float, default=0.9,
                         help="momentum")
@@ -1262,7 +1300,7 @@ def learn():
     parser.add_argument("--val_freq", type=int, default=10000,
         help="Number of batches between validations")
     parser.add_argument("--rand", dest="use_random_iterator", action="store_const",
-        default=False, const=True, help="Sample train batches")
+        default=False, const=True, help="Sample train batches (otherwise they will be consumed sequentially)")
 
     args = parser.parse_args()
 
@@ -1303,22 +1341,10 @@ def learn():
             raise Exception("Model file exists! The old file will not be overriden")
 
         input_specs = "targets:dense:{},weights:dense:1,".format(num_targets) + args.inputs
-        model_input_vars = get_input_vars(input_specs,
-            args.train, args.loss == "pairwise")[2:]
+        model_input_vars = get_input_vars(input_specs, args.train)[2:]
         unn = build_unn(model_input_vars, args.architecture)
 
-    if args.loss == "pairwise":
-        actual_input_vars = []
-        for var in model_input_vars:
-            var = copy.copy(var)
-            var.name = "left_" + var.name
-            actual_input_vars.append(var)
-        for var in input_vars:
-            var = copy.copy(var)
-            var.name = "right_" + var.name
-            actual_input_vars.append(var)
-    else:
-        actual_input_vars = copy.copy(model_input_vars)
+    actual_input_vars = copy.copy(model_input_vars)
     actual_input_vars.insert(0, Variable(name="weights", type="dense", num_features=1))
     actual_input_vars.insert(0, Variable(name="targets", type="dense", num_features=num_targets))
 
@@ -1338,11 +1364,9 @@ def learn():
         validation_dataset = None
 
     learn_model = unn.get_computer()
-    if args.loss == "pairwise":
-        learn_model = PairwiseModel(learn_model)
     if args.loss == "mse":
         train_energy = MseEnergy(learn_model)
-    elif args.loss in ["cross_entropy", "pairwise"]:
+    elif args.loss == "cross_entropy":
         train_energy = CrossEntropyEnergy(learn_model)
     else:
         assert False
@@ -1350,7 +1374,7 @@ def learn():
     if validation_dataset is not None:
         if args.validation_loss == "mse":
             validation_energy = MseEnergy(learn_model)
-        elif args.validation_loss in ["cross_entropy", "pairwise"]:
+        elif args.validation_loss == "cross_entropy":
             validation_energy = CrossEntropyEnergy(learn_model)
         elif args.validation_loss == "accuracy":
             validation_energy = AccuracyEnergy(learn_model)
