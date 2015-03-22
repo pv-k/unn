@@ -1,6 +1,6 @@
 An easy to use neural networks tool for learning tree-like feedforward architectures with support for dense and sparse inputs.
 
-##Example
+##Usage
 
 Assume that we want to classify pairs of texts into matching and not matching. This problem may arise in many contexts, for example the first text may be a query, and the second - text of a related or a nonrelated document. In this case we may come up with the following solution. First, we convert the texts to sparse vectors (build a bag of words or trigrams representation). Then, create the learn and validation files (don't forget to shuffle the lines!) in the following format:
 
