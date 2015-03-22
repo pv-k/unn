@@ -28,7 +28,7 @@ Here -o is which variable to output (it can be any named variable, for example '
 
 It is possible to create a function with shared parameters. For example, the previous example could look as follows:
 
-python unn.py learn -m model.net -f train -t val -i query:sparse:700000,doc:sparse:700000 -a 'embed(input:sparse:700000)=linear(rlu(rlu(input,100),300),300)| query_embedding=embed(query)|doc_embedding=embed(doc)|output=sigmoid(rlu(concat(query_embedding, doc_embedding), 300), 1) --loss cross_entropy
+python unn.py learn -m model.net -f train -t val -i query:sparse:700000,doc:sparse:700000 -a 'embed(input:sparse:700000)=linear(rlu(rlu(input,100),300),300)|query_embedding=embed(query)|doc_embedding=embed(doc)|output=sigmoid(rlu(concat(query_embedding, doc_embedding),300),1) --loss cross_entropy
 
 Here function 'embed' is applied to query and doc using the same parameters.
 
