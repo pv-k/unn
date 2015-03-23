@@ -10,7 +10,7 @@ Assume that we want to classify pairs of texts into matching and not matching. T
 
 1 \t 1 \t 1:1 3:4 1:4 \t 3:2 2:1.4 19:1
 
-Each line contains tab-separated columns. The first two columns are target and weight correspondingly. They may be followed by any number of columns. Each column contains space-separated values that represent different inputs to the neural network. In this example we have two sparse inputs obtained from the text.
+Each line contains tab-separated columns. The first two columns are target and weight correspondingly. They may be followed by any number of columns. Each column contains space-separated values that represent different inputs to the neural network. In this example we have two sparse inputs obtained from the texts (format: feature_index:feature_value).
 
 Now, we can start training a neural network. The tool provides an easy way to specify the architecture of the neural network directly in the command line. For example, we may run the following command:
 
@@ -22,9 +22,9 @@ A neural network consists of several submodules separated by '|' in the specific
 
 When we want to apply a trained neural network we can do the following:
 
-python unn.py apply -m model/model.net -o output -d val -i nothing1,nothing2,query,doc -f val.res
+python unn.py apply -m model/model.net -o output -d data -i nothing1,nothing2,query,doc -f val.res
 
-Here -o is which variable to output (it can be any named variable, for example 'doc_embedding'), -d - where the file with data is, -i - describes the columns of the input file (the columns may be arbitrary, the model will look only at the columns with the names required for computations), -f specifies where to save the result. If you have a model, but don't know the names of its inputs, or its named variables, run 'unn.py describe' to find this out.
+Here -o is which variable to output (it can be any named variable, for example 'doc_embedding'), -d - where the file with data is, -i - names the columns of the input file (the model will look only at the columns with the names required for computations. For example, here the model does not need columns 'nothing1' and 'nothing2' and ignores them), -f specifies where to save the result (each row of the output file will contain . If you have a model, but don't know the names of its inputs, or its named variables, run 'unn.py describe' to find this out.
 
 It is possible to create a function with shared parameters. For example, the previous example could look as follows:
 
