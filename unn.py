@@ -190,8 +190,9 @@ class Trainer(object):
     def fit(self, model, train_energy, validation_energy, save_path,
             train_dataset, validation_dataset, continue_learning):
         input_vars = {var.name: var for var in flatten(train_energy.get_inputs())}
-        for var in flatten(validation_energy.get_inputs()):
-            assert var.name in input_vars
+        if validation_energy is not None:
+            for var in flatten(validation_energy.get_inputs()):
+                assert var.name in input_vars
         transformers_map = {var.name: var.transformer for var in input_vars.values() if
             var.transformer is not None}
         input_theano_vars = {}
@@ -343,8 +344,7 @@ class Trainer(object):
                                     with open(tmp_model_path, "w") as f:
                                         pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
                                     os.rename(tmp_model_path, save_path)
-                                sys.stdout.write("Model saved\n".format(
-                                    epoch_ind, validation_score, best_validation_score))
+                                sys.stdout.write("Model saved\n")
 
                         batch_idx += 1
                     data_iter = train_dataset.read_train(self.batch_size)
@@ -1309,8 +1309,11 @@ def learn():
 
     if not os.path.exists(args.train):
         raise Exception("Train file is missing")
-    if not os.path.exists(args.test):
-        raise Exception("Validation file is missing")
+    if args.test is None or not os.path.exists(args.test):
+        print "Warning: no validation. The model will be saved each {} batches".format(args.val_freq)
+    else:
+        if not os.path.exists(args.test):
+            raise Exception("Train file is missing")
 
     args.inputs = "".join(args.inputs.split())
     args.architecture = "".join(args.architecture.split())
