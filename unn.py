@@ -635,7 +635,7 @@ class ScaleModule(Module):
         self.scaler = scaler
     def train_fprop(self, inputs):
         assert len(inputs) == 1
-        return inputs[0] * self.scaler, [], []
+        return inputs[0] * numpy.float32(self.scaler), [], []
 def scale(*inputs):
     if len(inputs) != 2:
         raise Exception("Invalid number of inputs in scale function")
@@ -1447,7 +1447,7 @@ def describe_model():
         sys.stderr.write("Cannot load the model: {}".format(ex))
         raise
 
-    print "Model archtecture:"
+    print "Model architecture:"
     for module in unn.architecture_string.split("|"):
         print "\t{}".format(module)
     print "Model inputs:"
