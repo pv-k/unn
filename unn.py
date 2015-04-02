@@ -61,9 +61,10 @@ class unique_tempdir(object):
 def uniq(a):
     return numpy.unique(a)
 
-def sgd_update(energy, params, learning_rates, momentums):
+def sgd_update(energy, params, learning_rates, momentums, nesterov=True):
     '''
-    Ordinary sgd with momentum. (not Nesterov momentum :( )
+    Sgd with momentum.
+        It is a bit complicated because of support for efficient sparse updates
     energy - what to minimize (theano symbolic),
     params - minimize with respect to these params (theano symbolic)
     learning_rates - learning rate per each parameters (theano symbolic)
@@ -92,7 +93,11 @@ def sgd_update(energy, params, learning_rates, momentums):
                     broadcastable=param.broadcastable)
                 updated_param_momentum = momentum * param_momentum + \
                     (numpy.float32(1.0) - momentum) * grad
-                updates.append((param, param - lr * updated_param_momentum))
+                if nesterov:
+                    updates.append((param, param - lr * ((numpy.float32(1.0) - momentum) * grad +
+                        momentum * updated_param_momentum)))
+                else:
+                    updates.append((param, param - lr * updated_param_momentum))
                 updates.append((param_momentum, updated_param_momentum))
             else:
                 updates.append((param, param - lr * grad))
@@ -123,6 +128,7 @@ def sgd_update(energy, params, learning_rates, momentums):
                 updated_indices_vars.append(param.nonzeroes)
             updated_indices = uniq(T.concatenate(updated_indices_vars))
 
+            new_param_W = param_W
             # decay momentum and add updates
             updated_param_momentum = T.set_subtensor(param_momentum[updated_indices],
                 param_momentum[updated_indices] * momentum)
@@ -130,11 +136,18 @@ def sgd_update(energy, params, learning_rates, momentums):
                 updated_param_momentum = T.inc_subtensor(
                     updated_param_momentum[param.nonzeroes],
                     (numpy.float32(1.0) - momentum) * grad)
+                if nesterov:
+                    new_param_W = T.inc_subtensor(
+                        new_param_W, -lr * (numpy.float32(1.0) - momentum) * grad)
             updates.append((param_momentum, updated_param_momentum))
 
-            new_value = T.inc_subtensor(param_W[updated_indices],
-                -lr * updated_param_momentum[updated_indices])
-            updates.append((param_W, new_value))
+            if nesterov:
+                new_param_W = T.inc_subtensor(param_W[updated_indices],
+                    -lr * momentum * updated_param_momentum[updated_indices])
+            else:
+                new_param_W = T.inc_subtensor(param_W[updated_indices],
+                    -lr * updated_param_momentum[updated_indices])
+            updates.append((param_W, new_param_W))
         else:
             new_value = param_W
             for lr, momentum, grad, param in param_data:
@@ -179,7 +192,7 @@ class Function(object):
 
 class Trainer(object):
     def __init__(self, learning_rate, momentum, num_epochs, reg_lambda, batch_size,
-            validation_frequency, loss_function):
+            validation_frequency, loss_function, optimizer):
         self.learning_rate = learning_rate
         self.momentum = momentum
         self.num_epochs = num_epochs
@@ -187,12 +200,14 @@ class Trainer(object):
         self.batch_size = batch_size
         self.validation_frequency = validation_frequency
         self.loss_function = loss_function
+        self.optimizer = optimizer
     def fit(self, model, train_energy, validation_energy, save_path,
             train_dataset, validation_dataset, continue_learning):
         input_vars = {var.name: var for var in flatten(train_energy.get_inputs())}
         if validation_energy is not None:
             for var in flatten(validation_energy.get_inputs()):
-                assert var.name in input_vars
+                if var.name not in input_vars:
+                    raise Exception("Validation energy has an unknown input: {}".format(var.name))
         transformers_map = {var.name: var.transformer for var in input_vars.values() if
             var.transformer is not None}
         input_theano_vars = {}
@@ -203,7 +218,7 @@ class Trainer(object):
                 input_theano_vars[var.name] = theano.sparse.csr_matrix(
                     name=var.name, dtype='float32')
             else:
-                assert False
+                raise Exception("Unknown variable type: {}".format(var.type))
 
         train_inputs = ravel([input_theano_vars[var.name] for var in
             flatten(train_energy.get_inputs())], train_energy.get_inputs())
@@ -217,13 +232,6 @@ class Trainer(object):
         print "Number of static penalized parameters: " + str(len(train_energy.get_penalized_params()))
         print "Number of dynamic penalized parameters: " + str(len(dynamic_penalized_params))
 
-        lr = theano.shared(numpy.float32(self.learning_rate))
-        if self.momentum is not None:
-            momentum = theano.shared(numpy.float32(self.momentum))
-        else:
-            momentum = None
-        learning_rates = [lr] * len(params)
-        momentums = [momentum] * len(params)
 
         l2_penalty = 0
         if self.reg_lambda != 0:
@@ -235,15 +243,36 @@ class Trainer(object):
         assert "weights" in input_vars
         sum_weights = T.sum(abs(input_theano_vars["weights"]))
 
-        train = Function(
-            input_transformers=transformers_map,
-            theano_inputs=input_theano_vars,
-            outputs=[train_loss, sum_weights],
-            updates=sgd_update(
-                energy=train_loss,
-                params=params,
-                learning_rates=learning_rates,
-                momentums=momentums))
+        lr = theano.shared(numpy.float32(self.learning_rate))
+        if self.momentum is not None:
+            momentum = theano.shared(numpy.float32(self.momentum))
+        else:
+            momentum = None
+        learning_rates = [lr] * len(params)
+        momentums = [momentum] * len(params)
+        if self.optimizer == "nesterov":
+            train = Function(
+                input_transformers=transformers_map,
+                theano_inputs=input_theano_vars,
+                outputs=[train_loss, sum_weights],
+                updates=sgd_update(
+                    energy=train_loss,
+                    params=params,
+                    learning_rates=learning_rates,
+                    momentums=momentums,
+                    nesterov=True))
+        else:
+            train = Function(
+                input_transformers=transformers_map,
+                theano_inputs=input_theano_vars,
+                outputs=[train_loss, sum_weights],
+                updates=sgd_update(
+                    energy=train_loss,
+                    params=params,
+                    learning_rates=learning_rates,
+                    momentums=momentums,
+                    nesterov=False))
+
         score_train = Function(input_transformers=transformers_map,
             theano_inputs=input_theano_vars,
             outputs=[train_energy.fprop(train_inputs) + l2_penalty, sum_weights])
@@ -401,12 +430,17 @@ class Module(object):
         self.input_vars = input_vars
         self.output = output_var
         self.output.producer = self
+    # returns 3 variables: output, dynamic params, dynamic penalized params
+    # Currently, dynamic params are the result of sparse affine ops. These are
+    # the parameters that are not persistent (exist only during function execution).
+    # As can be seen in sgd_update, we may still want to know their values
     def train_fprop(self, inputs):
         raise NotImplementedError()
     def fprop(self, inputs):
         return self.train_fprop(inputs)[0]
     def get_params(self):
         return []
+    # some parameters are not penalized, like biases in affine transformations
     def get_penalized_params(self):
         return []
     def get_inputs(self):
@@ -1171,7 +1205,7 @@ def get_input_vars(inputs_specification, dataset_file):
     for spec in inputs_specs:
         entries = spec.split("@")[0].split(":")
         if len(entries) > 3:
-            raise Exception("Frong number of fields in input specification: {}. Should be: name[:type:num_features@transformer]".format(spec))
+            raise Exception("Wrong number of fields in input specification: {}. Should be: name[:type:num_features@transformer]".format(spec))
         name = entries[0]
         if name in inputs_names:
             raise Exception("Duplicate input: " + name)
@@ -1301,6 +1335,7 @@ def learn():
         help="Number of batches between validations")
     parser.add_argument("--rand", dest="use_random_iterator", action="store_const",
         default=False, const=True, help="Sample train batches (otherwise they will be consumed sequentially)")
+    parser.add_argument("-o", "--optimizer", choices=["sgd", "nesterov"], default="nesterov")
 
     args = parser.parse_args()
 
@@ -1388,9 +1423,9 @@ def learn():
 
     trainer = Trainer(learning_rate=args.learning_rate, momentum=args.momentum,
         num_epochs=args.epochs, reg_lambda=args.reg_lambda, batch_size=args.batch_size,
-        validation_frequency=args.val_freq, loss_function=args.loss)
+        validation_frequency=args.val_freq, loss_function=args.loss, optimizer=args.optimizer)
 
-    print "Learning"
+    print "Learning with {} optimizer".format(args.optimizer)
     trainer.fit(model=unn, train_energy=train_energy,
         validation_energy=validation_energy, save_path=args.model_path,
         train_dataset=train_dataset, validation_dataset=validation_dataset,
