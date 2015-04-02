@@ -138,11 +138,11 @@ def sgd_update(energy, params, learning_rates, momentums, nesterov=True):
                     (numpy.float32(1.0) - momentum) * grad)
                 if nesterov:
                     new_param_W = T.inc_subtensor(
-                        new_param_W, -lr * (numpy.float32(1.0) - momentum) * grad)
+                        new_param_W[param.nonzeroes], -lr * (numpy.float32(1.0) - momentum) * grad)
             updates.append((param_momentum, updated_param_momentum))
 
             if nesterov:
-                new_param_W = T.inc_subtensor(param_W[updated_indices],
+                new_param_W = T.inc_subtensor(new_param_W[updated_indices],
                     -lr * momentum * updated_param_momentum[updated_indices])
             else:
                 new_param_W = T.inc_subtensor(param_W[updated_indices],
