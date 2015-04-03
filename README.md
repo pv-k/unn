@@ -24,7 +24,7 @@ When we want to apply a trained neural network we can do the following:
 
 python unn.py apply -m model/model.net -o output -d data -i nothing1,nothing2,query,doc -f val.res
 
-Here -o is which variable to output (it can be any named variable, for example 'doc_embedding'), -d - where the file with data is, -i - names the columns of the input file (the model will look only at the columns with the names required for computations. For example, here the model does not need columns 'nothing1' and 'nothing2' and ignores them), -f specifies where to save the result (each row of the output file will contain . If you have a model, but don't know the names of its inputs, or its named variables, run 'unn.py describe' to find this out.
+Here -o is which variable to output (it can be any named variable, for example 'doc_embedding'), -d - where the file with data is, -i - names the columns of the input file (the model will look only at the columns with the names required for computations. For example, here the model does not need columns 'nothing1' and 'nothing2' and ignores them), -f specifies where to save the result. If you have a model, but don't know the names of its inputs, or its named variables, run 'unn.py describe' to find this out.
 
 It is possible to create a function with shared parameters. For example, the previous example could look as follows:
 
