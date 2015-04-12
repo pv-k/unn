@@ -662,6 +662,21 @@ def dot(*inputs):
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [DotModule(inputs)]
+class CosineDistanceModule(Module):
+    def __init__(self, inputs):
+        num_output_features = 1
+        Module.__init__(self, inputs, Variable("dense", num_output_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 2
+        return (T.sum(inputs[0] * inputs[1], axis=1).dimshuffle((0, 'x')) / (1e-10 + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1))).dimshuffle((0, 'x')) / \
+            (1e-10 + T.sqrt(T.sum(inputs[1] * inputs[1], axis=1))).dimshuffle((0, 'x')) ), [], []
+def cosine_distance(*inputs):
+    if len(inputs) != 2:
+        raise Exception("Wrong number of inputs to cosine_distance: {}. Should be 2".format(len(inputs)))
+    for input in inputs:
+        if not isinstance(input, Variable):
+            raise Exception("Unknown input: " + str(input))
+    return [CosineDistanceModule(inputs)]
 
 class ScaleModule(Module):
     def __init__(self, input, scaler):
@@ -678,8 +693,44 @@ def scale(*inputs):
     try:
         float(inputs[1])
     except TypeError:
-        raise Exception("Cannot parse scalin constat as float")
+        raise Exception("Cannot parse scaling constat as float")
     return [ScaleModule(inputs[0], float(inputs[1]))]
+class AutoScaleModule(Module):
+    def __init__(self, input):
+        Module.__init__(self, [input], Variable(input.type, input.num_features, self))
+        self.scaler = theano.shared(numpy.float32(0.0), name="autoscaler")
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        return T.log(numpy.float32(1.0) + T.exp(self.scaler)) / numpy.float32(0.6931471805599453) * inputs[0], [], []
+    def get_params(self):
+        params = [self.scaler]
+        return params
+    def __get_state__(self):
+        data = {
+            "scaler" : self.scaler.get_value()
+        }
+        return data
+    def __set_state__(self, state):
+        self.scaler.set_value(state["scaler"])
+def autoscale(*inputs):
+    if len(inputs) != 1:
+        raise Exception("Invalid number of inputs in scale function")
+    if not isinstance(inputs[0], Variable):
+        raise Exception("Unknown input: " + str(input))
+    return [AutoScaleModule(inputs[0])]
+
+class UnitNormModule(Module):
+    def __init__(self, input):
+        Module.__init__(self, [input], Variable(input.type, input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        return inputs[0] / (1e-10 + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1)).dimshuffle((0, 'x'))), [], []
+def unit_norm(*inputs):
+    if len(inputs) != 1:
+        raise Exception("Invalid number of inputs in unit_norm function")
+    if not isinstance(inputs[0], Variable):
+        raise Exception("Unknown input: " + str(input))
+    return [UnitNormModule(inputs[0])]
 
 class SubModule(Module):
     def __init__(self, inputs):
@@ -1006,6 +1057,12 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
             modules = signed_sqrt(rng, *inputs)
         elif func_name == "sub":
             modules = sub(*inputs)
+        elif func_name == "cosine_distance":
+            modules = cosine_distance(*inputs)
+        elif func_name == "unit_norm":
+            modules = unit_norm(*inputs)
+        elif func_name == "autoscale":
+            modules = autoscale(*inputs)
         else:
             raise Exception("Unknown function: {}".format(func_name))
         toposorted_modules.extend(modules)
