@@ -29,6 +29,7 @@ import os.path
 import math
 
 import numpy
+import math
 import scipy.sparse
 import scipy.stats
 import shutil
@@ -37,6 +38,9 @@ import collections
 import tempfile
 import copy
 import bisect
+import threading
+import concurrent.futures
+import Queue
 
 import theano
 import theano.sparse
@@ -44,6 +48,7 @@ import theano.tensor as T
 import theano.tensor.nnet
 from theano.compile.ops import as_op
 import sklearn.preprocessing
+import signal
 
 class unique_tempdir(object):
     def __enter__(self):
@@ -156,6 +161,78 @@ def sgd_update(energy, params, learning_rates, momentums, nesterov=True):
             updates.append((param_W, new_value))
     return updates
 
+
+def adadelta_update(energy, params, decay, eps):
+    decay = numpy.float32(decay)
+    eps = numpy.float32(eps)
+
+    all_params = []
+    for param in params:
+        if isinstance(param, SparseDotParams):
+            all_params.append(param.compactW)
+        else:
+            all_params.append(param)
+    updates = []
+    grads = T.grad(energy, all_params)
+
+    sparse_params_data = collections.defaultdict(list)
+    for param, grad in zip(params, grads):
+        if isinstance(param, SparseDotParams):
+            sparse_params_data[param.W].append((grad, param))
+        else:
+            sqr_grad = theano.shared(
+                numpy.zeros_like(param.get_value()),
+                broadcastable=param.broadcastable)
+            sqr_delta = theano.shared(
+                numpy.zeros_like(param.get_value()),
+                broadcastable=param.broadcastable)
+            updated_sqr_grad = sqr_grad * decay + \
+                numpy.float32(1.0 - decay) * T.sqr(grad)
+            delta = -T.sqrt(sqr_delta + numpy.float32(eps)) / T.sqrt(updated_sqr_grad + eps) * grad
+            updated_sqr_delta = sqr_delta * decay + numpy.float32(1 - decay) * T.sqr(delta)
+            updates.append((param, param + delta))
+            updates.append((sqr_grad, updated_sqr_grad))
+            updates.append((sqr_delta, updated_sqr_delta))
+
+    for param_W in sparse_params_data:
+        param_data = sparse_params_data[param_W]
+
+        sqr_grad = theano.shared(
+            numpy.zeros_like(param_W.get_value()),
+            broadcastable=param_W.broadcastable)
+        cum_grad = theano.shared(
+            numpy.zeros_like(param_W.get_value()),
+            broadcastable=param_W.broadcastable)
+        sqr_delta = theano.shared(
+            numpy.zeros_like(param_W.get_value()),
+            broadcastable=param_W.broadcastable)
+
+        updated_indices_vars = []
+        for grad, param in param_data:
+            updated_indices_vars.append(param.nonzeroes)
+        updated_indices = uniq(T.concatenate(updated_indices_vars))
+
+        T.set_subtensor(cum_grad[updated_indices], numpy.float32(0))
+        for grad, param in param_data:
+            cum_grad = T.inc_subtensor(
+                cum_grad[param.nonzeroes], grad)
+        updated_sqr_grad = T.set_subtensor(
+                sqr_grad[updated_indices],
+                sqr_grad[updated_indices] * decay + (numpy.float32(1.0) - decay) * T.sqr(cum_grad[updated_indices]))
+
+        new_param_W = T.inc_subtensor(param_W[updated_indices],
+            -T.sqrt(sqr_delta[updated_indices] + eps) / T.sqrt(updated_sqr_grad[updated_indices] + eps) * cum_grad[updated_indices])
+        updated_sqr_delta = T.set_subtensor(
+                sqr_delta[updated_indices],
+                sqr_delta[updated_indices] * decay + numpy.float32(1.0 - decay) *
+                    (sqr_delta[updated_indices] + eps) / (updated_sqr_grad[updated_indices] + eps) * T.sqr(cum_grad[updated_indices]))
+
+        updates.append((sqr_grad, updated_sqr_grad))
+        updates.append((sqr_delta, updated_sqr_delta))
+        updates.append((param_W, new_param_W))
+    return updates
+
+
 def ravel(flat_list, deep_list):
     def sub_ravel(flat_iter, deep_list):
         res = []
@@ -191,16 +268,22 @@ class Function(object):
         return self.func(*inputs)
 
 class Trainer(object):
-    def __init__(self, learning_rate, momentum, num_epochs, reg_lambda, batch_size,
+    def __init__(self, updater_params, num_epochs, reg_lambda, batch_size,
             validation_frequency, loss_function, optimizer):
-        self.learning_rate = learning_rate
-        self.momentum = momentum
+        self.updater_params = updater_params
         self.num_epochs = num_epochs
         self.reg_lambda = reg_lambda
         self.batch_size = batch_size
         self.validation_frequency = validation_frequency
         self.loss_function = loss_function
         self.optimizer = optimizer
+    def save_model(self, model, save_path):
+        with unique_tempdir() as tmpdir:
+            tmp_model_path = os.path.join(tmpdir, "model.net")
+            with open(tmp_model_path, "w") as f:
+                pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
+            os.rename(tmp_model_path, save_path)
+        sys.stdout.write("Model saved\n")
     def fit(self, model, train_energy, validation_energy, save_path,
             train_dataset, validation_dataset, continue_learning):
         input_vars = {var.name: var for var in flatten(train_energy.get_inputs())}
@@ -232,7 +315,6 @@ class Trainer(object):
         print "Number of static penalized parameters: " + str(len(train_energy.get_penalized_params()))
         print "Number of dynamic penalized parameters: " + str(len(dynamic_penalized_params))
 
-
         l2_penalty = 0
         if self.reg_lambda != 0:
             for param in penalized_params:
@@ -243,35 +325,46 @@ class Trainer(object):
         assert "weights" in input_vars
         sum_weights = T.sum(abs(input_theano_vars["weights"]))
 
-        lr = theano.shared(numpy.float32(self.learning_rate))
-        if self.momentum is not None:
-            momentum = theano.shared(numpy.float32(self.momentum))
-        else:
-            momentum = None
-        learning_rates = [lr] * len(params)
-        momentums = [momentum] * len(params)
-        if self.optimizer == "nesterov":
+        if self.optimizer in ["nesterov", "sgd"]:
+            lr = theano.shared(numpy.float32(self.updater_params.learning_rate))
+            if self.updater_params.momentum is not None:
+                momentum = theano.shared(numpy.float32(self.updater_params.momentum))
+            else:
+                momentum = None
+            learning_rates = [lr] * len(params)
+            momentums = [momentum] * len(params)
+            if self.optimizer == "nesterov":
+                train = Function(
+                    input_transformers=transformers_map,
+                    theano_inputs=input_theano_vars,
+                    outputs=[train_loss, sum_weights],
+                    updates=sgd_update(
+                        energy=train_loss,
+                        params=params,
+                        learning_rates=learning_rates,
+                        momentums=momentums,
+                        nesterov=True))
+            else:
+                train = Function(
+                    input_transformers=transformers_map,
+                    theano_inputs=input_theano_vars,
+                    outputs=[train_loss, sum_weights],
+                    updates=sgd_update(
+                        energy=train_loss,
+                        params=params,
+                        learning_rates=learning_rates,
+                        momentums=momentums,
+                        nesterov=False))
+        elif self.optimizer == "adadelta":
             train = Function(
                 input_transformers=transformers_map,
                 theano_inputs=input_theano_vars,
                 outputs=[train_loss, sum_weights],
-                updates=sgd_update(
+                updates=adadelta_update(
                     energy=train_loss,
                     params=params,
-                    learning_rates=learning_rates,
-                    momentums=momentums,
-                    nesterov=True))
-        else:
-            train = Function(
-                input_transformers=transformers_map,
-                theano_inputs=input_theano_vars,
-                outputs=[train_loss, sum_weights],
-                updates=sgd_update(
-                    energy=train_loss,
-                    params=params,
-                    learning_rates=learning_rates,
-                    momentums=momentums,
-                    nesterov=False))
+                    decay=self.updater_params.decay,
+                    eps=self.updater_params.eps))
 
         score_train = Function(input_transformers=transformers_map,
             theano_inputs=input_theano_vars,
@@ -306,6 +399,18 @@ class Trainer(object):
                 print "Input data is used as is"
 
         print "Estimating initial performance"
+        if validation_energy is not None:
+            # compute validation score
+            best_validation_score = 0
+            weights_total = 0
+            for batch_idx, data_map in enumerate(validation_dataset.read(10000)):
+                batch_score, suw_weights = score_validation(data_map)
+                weights_total += suw_weights
+                best_validation_score += suw_weights * batch_score
+            best_validation_score *= 1.0 / weights_total
+
+            print "Initial validation score: {}".format(best_validation_score)
+
         # estimate training score
         train_score = 0
         weights_total = 0
@@ -317,29 +422,19 @@ class Trainer(object):
                 break
         train_score *= 1.0 / weights_total
 
-        if validation_energy is not None:
-            # compute validation score
-            best_validation_score = 0
-            weights_total = 0
-            for batch_idx, data_map in enumerate(validation_dataset.read(10000)):
-                batch_score, suw_weights = score_validation(data_map)
-                weights_total += suw_weights
-                best_validation_score += suw_weights * batch_score
-            best_validation_score *= 1.0 / weights_total
-
-            print "Initital validation score: {}".format(best_validation_score)
-
         print "Learning"
         # training
         train_decay = 0.999
         batch_idx = 0
         epoch_ind = 0
-        interrupts_budget = 10
+
+        if self.optimizer in ["nesterov", "sgd"]:
+            interrupts_budget = 10
         data_iter = train_dataset.read_train(self.batch_size)
+        start_time = time.time()
         while True:
             try:
                 while epoch_ind < self.num_epochs:
-                    start_time = time.time()
                     for data_map in data_iter:
                         batch_score = train(data_map)[0]
                         train_score = train_decay * train_score + (1 - train_decay) * batch_score
@@ -347,7 +442,7 @@ class Trainer(object):
                         if (batch_idx + 1) % 100 == 0:
                             elapsed = time.time() - start_time
                             sys.stdout.write("{}: Train score: {}; Elapsed: {}\n".format(
-                                (batch_idx + 1), train_score, elapsed) )
+                                (batch_idx + 1), train_score, elapsed))
                             start_time = time.time()
                         if (batch_idx + 1) % self.validation_frequency == 0:
                             if validation_energy is not None:
@@ -360,31 +455,24 @@ class Trainer(object):
                                 validation_score *= 1.0 / weights_total
                                 if validation_score < best_validation_score:
                                     best_validation_score = validation_score
-                                    with unique_tempdir() as tmpdir:
-                                        tmp_model_path = os.path.join(tmpdir, "model.net")
-                                        with open(tmp_model_path, "w") as f:
-                                            pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
-                                        os.rename(tmp_model_path, save_path)
+                                    self.save_model(model, save_path)
                                 sys.stdout.write("Epoch {}: validation score: {}; best validation score: {}\n".format(
                                     epoch_ind, validation_score, best_validation_score))
                             else:
-                                with unique_tempdir() as tmpdir:
-                                    tmp_model_path = os.path.join(tmpdir, "model.net")
-                                    with open(tmp_model_path, "w") as f:
-                                        pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
-                                    os.rename(tmp_model_path, save_path)
-                                sys.stdout.write("Model saved\n")
-
+                                self.save_model(model, save_path)
                         batch_idx += 1
                     data_iter = train_dataset.read_train(self.batch_size)
                     epoch_ind += 1
                 break
             except KeyboardInterrupt:
-                if interrupts_budget == 0:
+                if self.optimizer in ["nesterov", "sgd"]:
+                    if interrupts_budget == 0:
+                        raise
+                    interrupts_budget -= 1
+                    lr.set_value(lr.get_value() / numpy.float32(2.0))
+                    print "New learning rate set {}. Interrupts remaining: {}".format(lr.get_value(), interrupts_budget)
+                else:
                     raise
-                interrupts_budget -= 1
-                lr.set_value(lr.get_value() / numpy.float32(2.0))
-                print "New learning rate set {}. Interrupts remaining: {}".format(lr.get_value(), interrupts_budget)
 
 # ------------------------------apply---------------------------------------
 
@@ -724,7 +812,7 @@ class UnitNormModule(Module):
         Module.__init__(self, [input], Variable(input.type, input.num_features, self))
     def train_fprop(self, inputs):
         assert len(inputs) == 1
-        return inputs[0] / (1e-10 + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1)).dimshuffle((0, 'x'))), [], []
+        return inputs[0] / (numpy.float32(1e-10) + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1)).dimshuffle((0, 'x'))), [], []
 def unit_norm(*inputs):
     if len(inputs) != 1:
         raise Exception("Invalid number of inputs in unit_norm function")
@@ -1234,6 +1322,131 @@ class FileIterator(object):
         else:
             raise StopIteration()
 
+
+def prepare_batch(input_vars, batch_size, lines):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    arrays = []
+    for input_var in input_vars:
+        if input_var.type == "sparse":
+            arrays.append(SparseMatrixBuilder(input_var.num_features, batch_size))
+        elif input_var.type == "dense":
+            arrays.append(DenseMatrixBuilder(input_var.num_features, batch_size))
+        else:
+            arrays.append(None)
+
+    for idx, line in enumerate(lines):
+        entries = line.strip("\n").split("\t")
+        for input_idx, entry in enumerate(entries):
+            if arrays[input_idx] is not None:
+                arrays[input_idx].append_row(entry)
+    res = {}
+    for var, data in zip(input_vars, arrays):
+        if data is not None:
+            res[var.name] = data.get()
+    return res
+class AsyncFileIterator(object):
+    def __init__(self, input_file, input_vars, batch_size, cache_size=None, num_threads=1):
+        self.input_file = open(input_file)
+        self.input_vars = input_vars
+        self.batch_size = batch_size
+        if cache_size is None:
+            cache_size = max(1, math.ceil(1000000.0 / batch_size))
+        self.cache_size = cache_size
+
+        self.workers = concurrent.futures.ProcessPoolExecutor(num_threads)
+
+        self.batch_lines = Queue.Queue(maxsize=cache_size)
+        self.batches = Queue.Queue(maxsize=cache_size)
+        self.tasks = []
+        self.stopped = False
+
+        self.lines_producer = threading.Thread(target=self.read_batch_lines)
+        self.lines_producer.daemon = True
+        self.lines_producer.start()
+        self.batch_manager = threading.Thread(target=self.manage_producers)
+        self.batch_manager.daemon = True
+        self.batch_manager.start()
+    def read_batch_lines(self):
+        lines = []
+        for line in self.input_file:
+            if self.stopped:
+                return
+            lines.append(line)
+            if len(lines) == self.batch_size:
+                while True:
+                    try:
+                        self.batch_lines.put(lines, block=True, timeout=3)
+                        break
+                    except Queue.Full:
+                        if self.stopped:
+                            return
+                lines = []
+        if len(lines) > 0:
+            while True:
+                try:
+                    self.batch_lines.put(lines, block=True, timeout=3)
+                    break
+                except Queue.Full:
+                    if self.stopped:
+                        return
+    def manage_producers(self):
+        while self.lines_producer.is_alive() or len(self.tasks) > 0 or not self.batch_lines.empty():
+            active_tasks = []
+            for task in self.tasks:
+                if task.done():
+                    while True:
+                        try:
+                            self.batches.put(task.result(), block=True, timeout=3)
+                            break
+                        except Queue.Full:
+                            if self.stopped:
+                                return
+                else:
+                    active_tasks.append(task)
+            while len(active_tasks) < self.cache_size and not self.batch_lines.empty():
+                lines = self.batch_lines.get(block=True, timeout=3)
+                try:
+                    active_tasks.append(self.workers.submit(prepare_batch,
+                        self.input_vars, self.batch_size, lines))
+                except Exception as ex:
+                    if self.stopped:
+                        return
+                    else:
+                        raise
+            self.tasks = active_tasks
+            time.sleep(0.1)
+    def __iter__(self):
+        return self
+    def next(self):
+        while True:
+            if not self.batches.empty():
+                return self.batches.get()
+            else:
+                time.sleep(1)
+                if not self.batch_manager.is_alive():
+                    raise StopIteration()
+    def stop(self):
+        self.stopped = True
+        self.workers.shutdown()
+
+class AsyncFileDataset(object):
+    def __init__(self, input_file, input_vars):
+        self.input_file = input_file
+        self.input_vars = input_vars
+        self.iter = None
+    def read_train(self, batch_size):
+        # only one iterator may be active
+        if self.iter is not None:
+            self.iter.stop()
+        self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size)
+        return self.iter
+    def read(self, batch_size):
+        # only one iterator may be active
+        if self.iter is not None:
+            self.iter.stop()
+        self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size)
+        return self.iter
+
 class FileDataset(object):
     def __init__(self, input_file, input_vars):
         self.input_file = input_file
@@ -1350,6 +1563,8 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
 
 #--------------------------------modes-----------------------------------
 
+class Object(object):
+    pass
 def learn():
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_path", default="model.net")
@@ -1360,9 +1575,13 @@ def learn():
     parser.add_argument('-f', "--train", required=True,
         help="path to the learn dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
     parser.add_argument("--mf", dest="keep_train_in_memory", help="read train data from memory", action="store_const", const=True, default=False)
+    parser.add_argument("--aff", dest="use_async_file_reader_for_train",
+        help="Experimental option: read data from file asyncroniously", action="store_const", const=True, default=False)
     parser.add_argument('-t', "--test",
         help="path to the validation dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
     parser.add_argument("--mt", dest="keep_validation_in_memory", help="read validation data from memory", action="store_const", const=True, default=False)
+    parser.add_argument("--aft", dest="use_async_file_reader_for_test",
+        help="Experimental option: read data from file asyncroniously", action="store_const", const=True, default=False)
     parser.add_argument('-i', "--inputs",
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
             "Names 'targets' and 'weights' are reserved."
@@ -1382,17 +1601,23 @@ def learn():
                         help="Number of training epochs. Each epoch is one pass through the train dataset")
     parser.add_argument("--batch_size", type=int, default=30,
                         help="Batch size")
-    parser.add_argument("--lr", "--learning_rate", dest="learning_rate", type=float, default=0.1,
-                        help="learning rate")
-    parser.add_argument("--momentum", type=float, default=0.9,
-                        help="momentum")
-    parser.add_argument("-l", dest="reg_lambda", type=float, default=0,
-                        help="l2 regularization lambda")
     parser.add_argument("--val_freq", type=int, default=10000,
         help="Number of batches between validations")
     parser.add_argument("--rand", dest="use_random_iterator", action="store_const",
         default=False, const=True, help="Sample train batches (otherwise they will be consumed sequentially)")
-    parser.add_argument("-o", "--optimizer", choices=["sgd", "nesterov"], default="nesterov")
+    parser.add_argument("-o", "--optimizer", choices=["sgd", "nesterov", "adadelta"], default="nesterov")
+    parser.add_argument("-l", dest="reg_lambda", type=float, default=0,
+                        help="l2 regularization lambda")
+
+    # optimizers params
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help="momentum. Valid for nesterov and sgd optimizers")
+    parser.add_argument("--lr", "--learning_rate", dest="learning_rate", type=float, default=0.1,
+                        help="learning rate. Valid for nesterov and sgd optimizers")
+    parser.add_argument("--decay", type=float, default=0.95,
+                        help="Valid for adadelta optimizer")
+    parser.add_argument("--eps", "--eps", type=float, default=1e-5,
+                        help="Valid for adadelta optimizer")
 
     args = parser.parse_args()
 
@@ -1447,12 +1672,16 @@ def learn():
     assert not args.use_random_iterator or args.keep_train_in_memory
     if args.keep_train_in_memory:
         train_dataset = load_dataset_from_file(args.train, actual_input_vars, args.use_random_iterator)
+    elif args.use_async_file_reader_for_train:
+        train_dataset = AsyncFileDataset(args.train, actual_input_vars)
     else:
         train_dataset = FileDataset(args.train, actual_input_vars)
     print "reading validation"
     if args.test is not None:
         if args.keep_validation_in_memory:
             validation_dataset = load_dataset_from_file(args.test, actual_input_vars)
+        elif args.use_async_file_reader_for_test:
+            validation_dataset = AsyncFileDataset(args.test, actual_input_vars)
         else:
             validation_dataset = FileDataset(args.test, actual_input_vars)
     else:
@@ -1478,7 +1707,16 @@ def learn():
     else:
         validation_energy = None
 
-    trainer = Trainer(learning_rate=args.learning_rate, momentum=args.momentum,
+    if args.optimizer in ["nesterov", "sgd"]:
+        updater_params = Object()
+        updater_params.momentum = args.momentum
+        updater_params.learning_rate = args.learning_rate
+    elif args.optimizer == "adadelta":
+        updater_params = Object()
+        updater_params.decay = args.decay
+        updater_params.eps = args.eps
+
+    trainer = Trainer(updater_params=updater_params,
         num_epochs=args.epochs, reg_lambda=args.reg_lambda, batch_size=args.batch_size,
         validation_frequency=args.val_freq, loss_function=args.loss, optimizer=args.optimizer)
 
@@ -1548,7 +1786,7 @@ def describe_model():
             var.name, var.type, var.transformer, var.num_features)
 
 def print_help():
-    print "Neural network-based sparse vectors matcher. Usage:"
+    print "Usage:"
     print "\tunn.py learn ... - learn a model"
     print "\tunn.py apply ... - apply model to data"
     print "\tunn.py describe ... - print model architecture"
