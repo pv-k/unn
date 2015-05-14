@@ -918,11 +918,16 @@ class AccuracyEnergy(Module):
 
 class FuncWrapperModule(Module):
     def __init__(self, func_module, inputs):
-        assert len(inputs) == len(func_module.get_inputs())
+        assert len(inputs) == len(func_module.get_defined_inputs())
+        func_module_inputs = list(func_module.get_inputs())
+        for input, func_input in zip(inputs, func_module.get_defined_inputs()):
+            if func_input in func_module_inputs:
+                func_module_inputs[func_module_inputs.index(func_input)] = input
+            else:
+                raise Exception("A function takes variable {}, but does not use it".format(func_input.name))
         output = func_module.get_output()
-        Module.__init__(self, inputs, Variable(output.type, output.num_features, self))
+        Module.__init__(self, func_module_inputs, Variable(output.type, output.num_features, self))
         self.func_module = func_module
-        self.inputs = inputs
     def train_fprop(self, inputs):
         assert len(inputs) == len(self.get_inputs())
         return self.func_module.train_fprop(inputs)
@@ -934,9 +939,8 @@ class FuncWrapperModule(Module):
         return self.func_module.get_penalized_params()
 
 class FuncModule(Module):
-    def __init__(self, inputs, output, toposorted_modules):
+    def __init__(self, inputs, output, toposorted_modules, defined_inputs=None):
         assert isinstance(inputs, (list, tuple))
-        Module.__init__(self, inputs, output)
         # just a validity check: all real inputs are in inputs
         inputs_map = {var.name: var for var in inputs}
         intermediates = set()
@@ -944,11 +948,18 @@ class FuncModule(Module):
             for input in module.get_inputs():
                 if not isinstance(input, Variable):
                     raise Exception("Incorrect input specified: {}".format(input))
-                if input not in intermediates:
-                    assert input.name in inputs_map
+                if input.name not in inputs_map and input not in intermediates:
+                    if isinstance(module, FuncWrapperModule):
+                        # func wrapper hid this input
+                        inputs.append(input)
+                    else:
+                        raise Exception("Strange input: name {}, variable {}, module {}".format(input.name, input, module))
             intermediates.add(module.get_output())
-
+        Module.__init__(self, inputs, output)
+        self.defined_inputs = defined_inputs
         self.toposorted_modules = toposorted_modules
+    def get_defined_inputs(self):
+        return self.defined_inputs
     def train_fprop(self, inputs):
         assert len(inputs) == len(self.get_inputs())
         context = {}
@@ -1106,6 +1117,8 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
         new_func_name = func_definition
         func_inputs = []
 
+    defined_func_inputs = list(func_inputs)
+
     # parse func expression
     input_map = {var.name: var for var in func_inputs}
     toposorted_modules = []
@@ -1156,7 +1169,7 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
         toposorted_modules.extend(modules)
         return modules[-1].get_output()
     output = sub_make_function(function_expression)
-    return new_func_name, FuncModule(func_inputs, output, toposorted_modules)
+    return new_func_name, FuncModule(func_inputs, output, toposorted_modules, defined_func_inputs)
 def build_unn(input_variables, architecture_string):
     modules = architecture_string.split("|")
     inputs_map = {}
@@ -1552,6 +1565,8 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
                 sys.stdout.flush()
             entries = line.strip("\n").split("\t")
             if len(entries) != len(arrays):
+                print "idx=" + str(idx)
+                print "num_entries="+ str(len(entries))
                 raise Exception("Wrong number of inputs in " + file_)
 
             for builder, entry in zip(arrays, entries):
