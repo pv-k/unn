@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """Copyright (c) 2015, Pavel Kalinin
 All rights reserved.
 
@@ -39,7 +41,6 @@ import tempfile
 import copy
 import bisect
 import threading
-import concurrent.futures
 import Queue
 
 import theano
@@ -49,6 +50,7 @@ import theano.tensor.nnet
 from theano.compile.ops import as_op
 import sklearn.preprocessing
 import signal
+import concurrent.futures
 
 class unique_tempdir(object):
     def __enter__(self):
@@ -257,7 +259,7 @@ class Function(object):
         self.ordered_names = [var_name for var_name in theano_inputs]
         ordered_theano_inputs = [theano_inputs[var_name] for var_name in self.ordered_names]
         self.func = theano.function(inputs=ordered_theano_inputs,
-            outputs=outputs, updates=updates)
+            outputs=outputs, updates=updates, on_unused_input="warn")
         self.transformers_map = input_transformers
     def __call__(self, inputs_map):
         for var_name, var_data in inputs_map.items():
@@ -285,7 +287,7 @@ class Trainer(object):
             os.rename(tmp_model_path, save_path)
         sys.stdout.write("Model saved\n")
     def fit(self, model, train_energy, validation_energy, save_path,
-            train_dataset, validation_dataset, continue_learning):
+            train_dataset, validation_dataset, continue_learning, start_batch=0):
         input_vars = {var.name: var for var in flatten(train_energy.get_inputs())}
         if validation_energy is not None:
             for var in flatten(validation_energy.get_inputs()):
@@ -368,7 +370,7 @@ class Trainer(object):
 
         score_train = Function(input_transformers=transformers_map,
             theano_inputs=input_theano_vars,
-            outputs=[train_energy.fprop(train_inputs) + l2_penalty, sum_weights])
+            outputs=[train_loss, sum_weights])
 
         if validation_energy is not None:
             validation_inputs = {var.name: input_theano_vars[var.name] for var in
@@ -436,6 +438,12 @@ class Trainer(object):
             try:
                 while epoch_ind < self.num_epochs:
                     for data_map in data_iter:
+                        if batch_idx < start_batch:
+                            batch_idx += 1
+                            if (batch_idx + 1) % 100 == 0:
+                                sys.stdout.write("\rCurrent batch:  {}".format(batch_idx))
+                                sys.stdout.flush()
+                            continue
                         batch_score = train(data_map)[0]
                         train_score = train_decay * train_score + (1 - train_decay) * batch_score
 
@@ -675,6 +683,25 @@ def sigmoid(rng, input_variable, num_outputs=None):
     modules.append(SigmoidModule(input_variable))
     return modules
 
+class ExpModule(Module):
+    def __init__(self, input):
+        Module.__init__(self, [input], Variable("dense", input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        var = inputs[0]
+        return T.exp(var), [], []
+def exp(rng, input_variable, num_outputs=None):
+    modules = []
+    if not isinstance(input_variable, Variable):
+        raise Exception("Unknown input: " + str(input_variable))
+    if num_outputs is not None:
+        num_outputs = int(num_outputs)
+        modules.append(AffineModule(rng, input_variable,
+            num_outputs, "exp"))
+        input_variable = modules[-1].get_output()
+    modules.append(ExpModule(input_variable))
+    return modules
+
 class TanhModule(Module):
     def __init__(self, input):
         Module.__init__(self, [input], Variable("dense", input.num_features, self))
@@ -807,6 +834,37 @@ def autoscale(*inputs):
         raise Exception("Unknown input: " + str(input))
     return [AutoScaleModule(inputs[0])]
 
+class DivideModule(Module):
+    def __init__(self, input1, input2):
+        Module.__init__(self, [input1, input2], Variable(input1.type, input1.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 2
+        return inputs[0] / inputs[1], [], []
+def divide(*inputs):
+    if len(inputs) != 2:
+        raise Exception("Invalid number of inputs in divide function")
+    if not isinstance(inputs[0], Variable):
+        raise Exception("Unknown input: " + str(inputs[0]))
+    if not isinstance(inputs[1], Variable):
+        raise Exception("Unknown input: " + str(inputs[1]))
+    return [DivideModule(*inputs)]
+class AddModule(Module):
+    def __init__(self, inputs):
+        Module.__init__(self, inputs, Variable(inputs[0].type, inputs[0].num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) > 0
+        res = inputs[0]
+        for input in inputs[1:]:
+            res += input
+        return res, [], []
+def add(*inputs):
+    if len(inputs) < 1:
+        raise Exception("Invalid number of inputs in add function")
+    for input in inputs:
+        if not isinstance(input, Variable):
+            raise Exception("Unknown input: " + str(input))
+    return [AddModule(inputs)]
+
 class UnitNormModule(Module):
     def __init__(self, input):
         Module.__init__(self, [input], Variable(input.type, input.num_features, self))
@@ -859,6 +917,36 @@ class MseEnergy(Module):
         return self.model.get_params()
     def get_penalized_params(self):
         return self.model.get_penalized_params()
+class GaussianEnergy(Module):
+    def __init__(self, model, transformer=None):
+        inputs = (model.get_inputs(), Variable("dense", name="targets",
+            transformer=transformer), Variable("dense", name="weights"))
+        Module.__init__(self, inputs, Variable("dense"))
+        self.model = model
+    def train_fprop(self, inputs):
+        model_inputs = inputs[0]
+        model_output, model_dynamic_params, model_dynamic_penalized_params =\
+            self.model.train_fprop(model_inputs)
+        targets = inputs[1].ravel()
+        weights = inputs[2].ravel()
+        means = model_output[:, 0].ravel()
+        stds = model_output[:, 1].ravel()
+        energies = numpy.float32(0.5) * T.sqr((targets - means) / (numpy.float32(1e-10) + stds)) + T.log(stds + 1e-10)
+        return T.sum(weights * energies / T.sum(abs(weights))), \
+            model_dynamic_params, model_dynamic_penalized_params
+    def fprop(self, inputs):
+        model_inputs = inputs[0]
+        model_output = self.model.fprop(model_inputs)
+        targets = inputs[1].ravel()
+        weights = inputs[2].ravel()
+        means = model_output[:, 0].ravel()
+        stds = model_output[:, 1].ravel()
+        energies = numpy.float32(0.5) * T.sqr((targets - means) / (numpy.float32(1e-10) + stds)) + T.log(stds + 1e-10)
+        return T.sum(weights * energies / T.sum(abs(weights)))
+    def get_params(self):
+        return self.model.get_params()
+    def get_penalized_params(self):
+        return self.model.get_penalized_params()
 class CrossEntropyEnergy(Module):
     def __init__(self, model, transformer=None):
         inputs = (model.get_inputs(), Variable("dense", name="targets",
@@ -881,6 +969,31 @@ class CrossEntropyEnergy(Module):
         model_output = self.model.fprop(model_inputs)
         return -T.sum(weights * (targets * T.log(model_output + numpy.float32(1e-10)) +
             (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - model_output) )) / T.sum(abs(weights))
+    def get_params(self):
+        return self.model.get_params()
+    def get_penalized_params(self):
+        return self.model.get_penalized_params()
+class MyersonEnergy(Module):
+    def __init__(self, model, transformer=None):
+        inputs = (model.get_inputs(), Variable("dense", name="targets",
+            transformer=transformer), Variable("dense", name="weights"))
+        Module.__init__(self, inputs, Variable("dense"))
+        self.model = model
+    def train_fprop(self, inputs):
+        model_inputs = inputs[0]
+        model_output, model_dynamic_params, model_dynamic_penalized_params =\
+            self.model.train_fprop(model_inputs)
+        targets = inputs[1]
+        weights = inputs[2]
+        return T.sum(weights * ((targets >= model_output) * (targets - model_output) +
+                (targets < model_output) * (targets - targets * T.exp(targets - model_output)))) / T.sum(abs(weights)), \
+                model_dynamic_params, model_dynamic_penalized_params
+    def fprop(self, inputs):
+        model_inputs = inputs[0]
+        targets = inputs[1]
+        weights = inputs[2]
+        model_output = self.model.fprop(model_inputs)
+        return -T.sum(weights * (targets >= model_output) * model_output) / T.sum(abs(weights))
     def get_params(self):
         return self.model.get_params()
     def get_penalized_params(self):
@@ -1148,6 +1261,8 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
             modules = tanh(rng, *inputs)
         elif func_name == "linear":
             modules = linear(rng, *inputs)
+        elif func_name == "exp":
+            modules = exp(rng, *inputs)
         elif func_name == "concat":
             modules = concat(*inputs)
         elif func_name == "dot":
@@ -1164,6 +1279,10 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
             modules = unit_norm(*inputs)
         elif func_name == "autoscale":
             modules = autoscale(*inputs)
+        elif func_name == "divide":
+            modules = divide(*inputs)
+        elif func_name == "add":
+            modules = add(*inputs)
         else:
             raise Exception("Unknown function: {}".format(func_name))
         toposorted_modules.extend(modules)
@@ -1358,18 +1477,17 @@ def prepare_batch(input_vars, batch_size, lines):
             res[var.name] = data.get()
     return res
 class AsyncFileIterator(object):
-    def __init__(self, input_file, input_vars, batch_size, cache_size=None, num_threads=1):
+    def __init__(self, input_file, input_vars, batch_size, num_threads=1):
+        self.init(input_file, input_vars, batch_size)
+        self.workers = concurrent.futures.ProcessPoolExecutor(num_threads)
+    def init(self, input_file, input_vars, batch_size):
         self.input_file = open(input_file)
         self.input_vars = input_vars
         self.batch_size = batch_size
-        if cache_size is None:
-            cache_size = max(1, math.ceil(1000000.0 / batch_size))
-        self.cache_size = cache_size
+        self.cache_size = max(1, math.ceil(1000000.0 / batch_size))
 
-        self.workers = concurrent.futures.ProcessPoolExecutor(num_threads)
-
-        self.batch_lines = Queue.Queue(maxsize=cache_size)
-        self.batches = Queue.Queue(maxsize=cache_size)
+        self.batch_lines = Queue.Queue(maxsize=self.cache_size)
+        self.batches = Queue.Queue(maxsize=self.cache_size)
         self.tasks = []
         self.stopped = False
 
@@ -1379,6 +1497,11 @@ class AsyncFileIterator(object):
         self.batch_manager = threading.Thread(target=self.manage_producers)
         self.batch_manager.daemon = True
         self.batch_manager.start()
+    def reset(self, input_file, input_vars, batch_size):
+        self.stopped = True
+        while self.lines_producer.is_alive() or self.batch_manager.is_alive():
+            time.sleep(1)
+        self.init(input_file, input_vars, batch_size)
     def read_batch_lines(self):
         lines = []
         for line in self.input_file:
@@ -1409,11 +1532,14 @@ class AsyncFileIterator(object):
                 if task.done():
                     while True:
                         try:
-                            self.batches.put(task.result(), block=True, timeout=3)
+                            if not task.cancelled():
+                                self.batches.put(task.result(), block=True, timeout=3)
                             break
                         except Queue.Full:
                             if self.stopped:
-                                return
+                                for task in self.tasks:
+                                    task.cancel()
+                                    return
                 else:
                     active_tasks.append(task)
             while len(active_tasks) < self.cache_size and not self.batch_lines.empty():
@@ -1423,11 +1549,17 @@ class AsyncFileIterator(object):
                         self.input_vars, self.batch_size, lines))
                 except Exception as ex:
                     if self.stopped:
+                        for task in self.tasks:
+                            task.cancel()
+                            return
                         return
                     else:
                         raise
             self.tasks = active_tasks
-            time.sleep(0.1)
+            if self.stopped:
+                for task in self.tasks:
+                    task.cancel()
+            time.sleep(1)
     def __iter__(self):
         return self
     def next(self):
@@ -1438,26 +1570,27 @@ class AsyncFileIterator(object):
                 time.sleep(1)
                 if not self.batch_manager.is_alive():
                     raise StopIteration()
-    def stop(self):
-        self.stopped = True
-        self.workers.shutdown()
 
 class AsyncFileDataset(object):
-    def __init__(self, input_file, input_vars):
+    def __init__(self, input_file, input_vars, num_threads=1):
+        import concurrent.futures
         self.input_file = input_file
         self.input_vars = input_vars
         self.iter = None
+        self.num_threads = num_threads
     def read_train(self, batch_size):
         # only one iterator may be active
         if self.iter is not None:
-            self.iter.stop()
-        self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size)
+            self.iter.reset(self.input_file, self.input_vars, batch_size)
+        else:
+            self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
         return self.iter
     def read(self, batch_size):
         # only one iterator may be active
         if self.iter is not None:
-            self.iter.stop()
-        self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size)
+            self.iter.reset(self.input_file, self.input_vars, batch_size)
+        else:
+            self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
         return self.iter
 
 class FileDataset(object):
@@ -1590,25 +1723,27 @@ def learn():
     parser.add_argument('-f', "--train", required=True,
         help="path to the learn dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
     parser.add_argument("--mf", dest="keep_train_in_memory", help="read train data from memory", action="store_const", const=True, default=False)
-    parser.add_argument("--aff", dest="use_async_file_reader_for_train",
-        help="Experimental option: read data from file asyncroniously", action="store_const", const=True, default=False)
+    parser.add_argument("--aff", dest="train_async_file_reader_num_threads",
+        help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     parser.add_argument('-t', "--test",
         help="path to the validation dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
     parser.add_argument("--mt", dest="keep_validation_in_memory", help="read validation data from memory", action="store_const", const=True, default=False)
-    parser.add_argument("--aft", dest="use_async_file_reader_for_test",
-        help="Experimental option: read data from file asyncroniously", action="store_const", const=True, default=False)
+    parser.add_argument("--aft", dest="test_async_file_reader_num_threads",
+        help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     parser.add_argument('-i', "--inputs",
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
             "Names 'targets' and 'weights' are reserved."
             "Entry 'num_features' is optional for dense input. Entry 'type' for dense input is optional - it will be inferred from "
             "the data. Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - scale) is valid only for dense input")
+    parser.add_argument('--sb', "--start_batch", dest="start_batch",
+        help="Start batch. In case previous run failed", type=int, default=0)
 
     # unn architecture
     parser.add_argument("-a", "--architecture", help="architecture of the network. Format <func>|<func>|...|<func>"
         " where <func> can be <func_name>(<input_name>:<type>:<num_features>,...)=func_expression(input_name) (use this to create shared modules)"
         " or <output_name>=func_expression. The last <func> is model output")
-    parser.add_argument("--loss", choices=["mse", "cross_entropy"], help="Loss function", default="mse")
-    parser.add_argument("--vloss", dest="validation_loss", choices=["accuracy", "mse", "cross_entropy"],
+    parser.add_argument("--loss", choices=["mse", "cross_entropy", "myerson", "gauss"], help="Loss function", default="mse")
+    parser.add_argument("--vloss", dest="validation_loss", choices=["accuracy", "mse", "cross_entropy", "myerson", "gauss"],
         help="Validation loss (specify if you want it be different from train loss). Currently 'accuracy' supports just one output", default=None)
 
     # learning parameters
@@ -1679,6 +1814,9 @@ def learn():
         model_input_vars = get_input_vars(input_specs, args.train)[2:]
         unn = build_unn(model_input_vars, args.architecture)
 
+    # AsyncFileDataset spawns new subprocesses and causes memory error
+    del unn
+
     actual_input_vars = copy.copy(model_input_vars)
     actual_input_vars.insert(0, Variable(name="weights", type="dense", num_features=1))
     actual_input_vars.insert(0, Variable(name="targets", type="dense", num_features=num_targets))
@@ -1687,26 +1825,41 @@ def learn():
     assert not args.use_random_iterator or args.keep_train_in_memory
     if args.keep_train_in_memory:
         train_dataset = load_dataset_from_file(args.train, actual_input_vars, args.use_random_iterator)
-    elif args.use_async_file_reader_for_train:
-        train_dataset = AsyncFileDataset(args.train, actual_input_vars)
+    elif args.train_async_file_reader_num_threads != 0:
+        train_dataset = AsyncFileDataset(args.train, actual_input_vars, args.train_async_file_reader_num_threads)
     else:
         train_dataset = FileDataset(args.train, actual_input_vars)
     print "reading validation"
     if args.test is not None:
         if args.keep_validation_in_memory:
             validation_dataset = load_dataset_from_file(args.test, actual_input_vars)
-        elif args.use_async_file_reader_for_test:
-            validation_dataset = AsyncFileDataset(args.test, actual_input_vars)
+        elif args.test_async_file_reader_num_threads != 0:
+            validation_dataset = AsyncFileDataset(args.test, actual_input_vars, args.test_async_file_reader_num_threads)
         else:
             validation_dataset = FileDataset(args.test, actual_input_vars)
     else:
         validation_dataset = None
+
+    # reload the model
+    if args.continue_learning:
+        try:
+            with open(args.model_path) as f:
+                unn = pickle.load(f)
+        except Exception as ex:
+            sys.stderr.write("Cannot load the model: {}".format(ex))
+            raise
+    else:
+        unn = build_unn(model_input_vars, args.architecture)
 
     learn_model = unn.get_computer()
     if args.loss == "mse":
         train_energy = MseEnergy(learn_model)
     elif args.loss == "cross_entropy":
         train_energy = CrossEntropyEnergy(learn_model)
+    elif args.loss == "myerson":
+        train_energy = MyersonEnergy(learn_model)
+    elif args.loss == "gauss":
+        train_energy = GaussianEnergy(learn_model)
     else:
         assert False
 
@@ -1717,6 +1870,10 @@ def learn():
             validation_energy = CrossEntropyEnergy(learn_model)
         elif args.validation_loss == "accuracy":
             validation_energy = AccuracyEnergy(learn_model)
+        elif args.validation_loss == "myerson":
+            validation_energy = MyersonEnergy(learn_model)
+        elif args.validation_loss == "gauss":
+            validation_energy = GaussianEnergy(learn_model)
         else:
             assert False
     else:
@@ -1739,7 +1896,7 @@ def learn():
     trainer.fit(model=unn, train_energy=train_energy,
         validation_energy=validation_energy, save_path=args.model_path,
         train_dataset=train_dataset, validation_dataset=validation_dataset,
-        continue_learning=args.continue_learning)
+        continue_learning=args.continue_learning, start_batch=args.start_batch)
     print "Finished"
 
 def apply_model_to_data():
