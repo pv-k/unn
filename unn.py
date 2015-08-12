@@ -499,7 +499,7 @@ def apply_model(model, dataset, output_stream):
         theano_inputs=input_theano_vars,
         outputs=[model_output])
 
-    for batch_idx, data_map in enumerate(dataset.read(10000)):
+    for batch_idx, (num_samples, data_map) in enumerate(dataset.read(10000)):
         output = eval_data(data_map)[0]
         output_stream.write("\n".join(("\t".join(str(val) for val in vals)) for vals in output) + "\n")
 
