@@ -271,28 +271,37 @@ class Function(object):
 
 class Trainer(object):
     def __init__(self, updater_params, num_epochs, reg_lambda, batch_size,
-            validation_frequency, loss_function, optimizer):
+            validation_frequency, optimizer):
         self.updater_params = updater_params
         self.num_epochs = num_epochs
         self.reg_lambda = reg_lambda
         self.batch_size = batch_size
         self.validation_frequency = validation_frequency
-        self.loss_function = loss_function
         self.optimizer = optimizer
-    def save_model(self, model, save_path):
-        with unique_tempdir() as tmpdir:
-            tmp_model_path = os.path.join(tmpdir, "model.net")
-            with open(tmp_model_path, "w") as f:
-                pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
-            os.rename(tmp_model_path, save_path)
-        sys.stdout.write("Model saved\n")
     def fit(self, model, train_energy, validation_energy, save_path,
-            train_dataset, validation_dataset, continue_learning, start_batch=0):
+            train_dataset, validation_dataset, continue_learning, always_save, start_batch=0):
         input_vars = {var.name: var for var in flatten(train_energy.get_inputs())}
         if validation_energy is not None:
             for var in flatten(validation_energy.get_inputs()):
                 if var.name not in input_vars:
                     raise Exception("Validation energy has an unknown input: {}".format(var.name))
+
+        have_new_transformers = False
+        for var_name, var in input_vars.items():
+            if hasattr(var, "transformer_name") and var.transformer_name is not None and var.transformer is None:
+                have_new_transformers = True
+                break
+        if have_new_transformers:
+            print "Fitting transformers"
+            for num_samples, data_map in train_dataset.read(1000000):
+                for var_name, var in input_vars.items():
+                    if hasattr(var, "transformer_name") and var.transformer_name is not None and var.transformer is None:
+                        var.transformer = get_transformer(var.transformer_name)
+                        print "... for " + var_name
+                        if var.transformer is not None:
+                            var.transformer.fit(data_map[var.name])
+                break
+
         transformers_map = {var.name: var.transformer for var in input_vars.values() if
             var.transformer is not None}
         input_theano_vars = {}
@@ -324,9 +333,6 @@ class Trainer(object):
         l2_penalty = l2_penalty * numpy.float32(self.reg_lambda)
         train_loss = train_loss + l2_penalty
 
-        assert "weights" in input_vars
-        sum_weights = T.sum(abs(input_theano_vars["weights"]))
-
         if self.optimizer in ["nesterov", "sgd"]:
             lr = theano.shared(numpy.float32(self.updater_params.learning_rate))
             if self.updater_params.momentum is not None:
@@ -339,7 +345,7 @@ class Trainer(object):
                 train = Function(
                     input_transformers=transformers_map,
                     theano_inputs=input_theano_vars,
-                    outputs=[train_loss, sum_weights],
+                    outputs=[train_loss],
                     updates=sgd_update(
                         energy=train_loss,
                         params=params,
@@ -350,7 +356,7 @@ class Trainer(object):
                 train = Function(
                     input_transformers=transformers_map,
                     theano_inputs=input_theano_vars,
-                    outputs=[train_loss, sum_weights],
+                    outputs=[train_loss],
                     updates=sgd_update(
                         energy=train_loss,
                         params=params,
@@ -361,7 +367,7 @@ class Trainer(object):
             train = Function(
                 input_transformers=transformers_map,
                 theano_inputs=input_theano_vars,
-                outputs=[train_loss, sum_weights],
+                outputs=[train_loss],
                 updates=adadelta_update(
                     energy=train_loss,
                     params=params,
@@ -370,7 +376,7 @@ class Trainer(object):
 
         score_train = Function(input_transformers=transformers_map,
             theano_inputs=input_theano_vars,
-            outputs=[train_loss, sum_weights])
+            outputs=[train_loss])
 
         if validation_energy is not None:
             validation_inputs = {var.name: input_theano_vars[var.name] for var in
@@ -381,48 +387,31 @@ class Trainer(object):
                 ravel(flat_validation_inputs, validation_energy.get_inputs()))
             score_validation = Function(input_transformers=transformers_map,
                 theano_inputs=validation_inputs,
-                outputs=[validation_loss, sum_weights])
-
-        if not continue_learning:
-            have_transformers = False
-            for var_name, var in input_vars.items():
-                if var.transformer is not None:
-                    have_transformers = True
-                    break
-
-            if have_transformers:
-                print "Fitting transformers"
-                for data_map in train_dataset.read(1000000):
-                    for var_name, var in input_vars.items():
-                        if var.transformer is not None:
-                            var.transformer.fit(data_map[var.name])
-                    break
-            else:
-                print "Input data is used as is"
+                outputs=[validation_loss])
 
         print "Estimating initial performance"
         if validation_energy is not None:
             # compute validation score
             best_validation_score = 0
-            weights_total = 0
-            for batch_idx, data_map in enumerate(validation_dataset.read(10000)):
-                batch_score, suw_weights = score_validation(data_map)
-                weights_total += suw_weights
-                best_validation_score += suw_weights * batch_score
-            best_validation_score *= 1.0 / weights_total
+            samples_total = 0
+            for batch_idx, (num_samples, data_map) in enumerate(validation_dataset.read(10000)):
+                batch_score = score_validation(data_map)[0]
+                samples_total += num_samples
+                best_validation_score += num_samples * batch_score
+            best_validation_score *= 1.0 / samples_total
 
             print "Initial validation score: {}".format(best_validation_score)
 
         # estimate training score
         train_score = 0
-        weights_total = 0
-        for batch_idx, data_map in enumerate(train_dataset.read(10000)):
-            batch_score, suw_weights = score_train(data_map)
-            weights_total += suw_weights
-            train_score += suw_weights * batch_score
+        samples_total = 0
+        for batch_idx, (num_samples, data_map) in enumerate(train_dataset.read(10000)):
+            batch_score = score_train(data_map)[0]
+            samples_total += num_samples
+            train_score += num_samples * batch_score
             if batch_idx > 10:
                 break
-        train_score *= 1.0 / weights_total
+        train_score *= 1.0 / samples_total
 
         print "Learning"
         # training
@@ -437,7 +426,7 @@ class Trainer(object):
         while True:
             try:
                 while epoch_ind < self.num_epochs:
-                    for data_map in data_iter:
+                    for num_samples, data_map in data_iter:
                         if batch_idx < start_batch:
                             batch_idx += 1
                             if (batch_idx + 1) % 100 == 0:
@@ -452,23 +441,26 @@ class Trainer(object):
                             sys.stdout.write("{}: Train score: {}; Elapsed: {}\n".format(
                                 (batch_idx + 1), train_score, elapsed))
                             start_time = time.time()
-                        if (batch_idx + 1) % self.validation_frequency == 0:
+                        batch_idx += 1
+                        if batch_idx % self.validation_frequency == 0:
                             if validation_energy is not None:
                                 validation_score = 0
-                                weights_total = 0
-                                for data_map in validation_dataset.read(10000):
-                                    batch_score, suw_weights = score_validation(data_map)
-                                    weights_total += suw_weights
-                                    validation_score += suw_weights * batch_score
-                                validation_score *= 1.0 / weights_total
+                                samples_total = 0
+                                for num_samples, data_map in validation_dataset.read(10000):
+                                    batch_score = score_validation(data_map)[0]
+                                    samples_total += num_samples
+                                    validation_score += num_samples * batch_score
+                                validation_score *= 1.0 / samples_total
+                                model_saved = False
+                                if validation_score < best_validation_score or always_save:
+                                    model.save(save_path)
+                                    model_saved = True
                                 if validation_score < best_validation_score:
                                     best_validation_score = validation_score
-                                    self.save_model(model, save_path)
-                                sys.stdout.write("Epoch {}: validation score: {}; best validation score: {}\n".format(
-                                    epoch_ind, validation_score, best_validation_score))
+                                sys.stdout.write("Epoch {}: validation score: {}; best validation score: {} {}\n".format(
+                                    epoch_ind, validation_score, best_validation_score, "model saved" if model_saved else ""))
                             else:
-                                self.save_model(model, save_path)
-                        batch_idx += 1
+                                model.save(save_path)
                     data_iter = train_dataset.read_train(self.batch_size)
                     epoch_ind += 1
                 break
@@ -512,6 +504,11 @@ def apply_model(model, dataset, output_stream):
         output_stream.write("\n".join(("\t".join(str(val) for val in vals)) for vals in output) + "\n")
 
 # -----------------------------------modules-----------------------
+modules_map = {}
+def register_module(name, func):
+    assert name not in modules_map
+    modules_map[name] = func
+
 class Variable(object):
     def __init__(self, type, num_features=None, producer=None, name=None,
             transformer=None):
@@ -663,6 +660,7 @@ def rlu(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(RluModule(input_variable))
     return modules
+register_module("rlu", rlu)
 
 class SigmoidModule(Module):
     def __init__(self, input):
@@ -682,6 +680,7 @@ def sigmoid(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(SigmoidModule(input_variable))
     return modules
+register_module("sigmoid", sigmoid)
 
 class ExpModule(Module):
     def __init__(self, input):
@@ -701,6 +700,7 @@ def exp(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(ExpModule(input_variable))
     return modules
+register_module("exp", exp)
 
 class TanhModule(Module):
     def __init__(self, input):
@@ -720,6 +720,8 @@ def tanh(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(TanhModule(input_variable))
     return modules
+register_module("tanh", tanh)
+
 class SignedSqrtModule(Module):
     def __init__(self, input):
         Module.__init__(self, [input], Variable("dense", input.num_features, self))
@@ -738,6 +740,7 @@ def signed_sqrt(rng, input_variable, num_outputs=None):
         input_variable = modules[-1].get_output()
     modules.append(SignedSqrtModule(input_variable))
     return modules
+register_module("signed_sqrt", signed_sqrt)
 
 def linear(rng, input_variable, num_outputs):
     if not isinstance(input_variable, Variable):
@@ -747,6 +750,7 @@ def linear(rng, input_variable, num_outputs):
     modules.append(AffineModule(rng, input_variable,
         num_outputs, "linear"))
     return modules
+register_module("linear", linear)
 
 class ConcatModule(Module):
     def __init__(self, inputs):
@@ -755,13 +759,14 @@ class ConcatModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == len(self.get_inputs())
         return T.concatenate(inputs, axis=1), [], []
-def concat(*inputs):
+def concat(rng, *inputs):
     if len(inputs) < 2:
         raise Exception("Concat function: nothing to concatenate")
     for input in inputs:
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [ConcatModule(inputs)]
+register_module("concat", concat)
 
 class DotModule(Module):
     def __init__(self, inputs):
@@ -770,13 +775,15 @@ class DotModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == 2
         return T.sum(inputs[0] * inputs[1], axis=1).dimshuffle((0, 'x')), [], []
-def dot(*inputs):
+def dot(rng, *inputs):
     if len(inputs) != 2:
         raise Exception("Wrong number of inputs to dot: {}. Should be 2".format(len(inputs)))
     for input in inputs:
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [DotModule(inputs)]
+register_module("dot", dot)
+
 class CosineDistanceModule(Module):
     def __init__(self, inputs):
         num_output_features = 1
@@ -785,13 +792,14 @@ class CosineDistanceModule(Module):
         assert len(inputs) == 2
         return (T.sum(inputs[0] * inputs[1], axis=1).dimshuffle((0, 'x')) / (1e-10 + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1))).dimshuffle((0, 'x')) / \
             (1e-10 + T.sqrt(T.sum(inputs[1] * inputs[1], axis=1))).dimshuffle((0, 'x')) ), [], []
-def cosine_distance(*inputs):
+def cosine_distance(rng, *inputs):
     if len(inputs) != 2:
         raise Exception("Wrong number of inputs to cosine_distance: {}. Should be 2".format(len(inputs)))
     for input in inputs:
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [CosineDistanceModule(inputs)]
+register_module("cosine_distance", cosine_distance)
 
 class ScaleModule(Module):
     def __init__(self, input, scaler):
@@ -800,7 +808,7 @@ class ScaleModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == 1
         return inputs[0] * numpy.float32(self.scaler), [], []
-def scale(*inputs):
+def scale(rng, *inputs):
     if len(inputs) != 2:
         raise Exception("Invalid number of inputs in scale function")
     if not isinstance(inputs[0], Variable):
@@ -810,6 +818,8 @@ def scale(*inputs):
     except TypeError:
         raise Exception("Cannot parse scaling constat as float")
     return [ScaleModule(inputs[0], float(inputs[1]))]
+register_module("scale", scale)
+
 class AutoScaleModule(Module):
     def __init__(self, input):
         Module.__init__(self, [input], Variable(input.type, input.num_features, self))
@@ -827,12 +837,13 @@ class AutoScaleModule(Module):
         return data
     def __set_state__(self, state):
         self.scaler.set_value(state["scaler"])
-def autoscale(*inputs):
+def autoscale(rng, *inputs):
     if len(inputs) != 1:
         raise Exception("Invalid number of inputs in scale function")
     if not isinstance(inputs[0], Variable):
         raise Exception("Unknown input: " + str(input))
     return [AutoScaleModule(inputs[0])]
+register_module("autoscale", autoscale)
 
 class DivideModule(Module):
     def __init__(self, input1, input2):
@@ -840,7 +851,7 @@ class DivideModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == 2
         return inputs[0] / inputs[1], [], []
-def divide(*inputs):
+def divide(rng, *inputs):
     if len(inputs) != 2:
         raise Exception("Invalid number of inputs in divide function")
     if not isinstance(inputs[0], Variable):
@@ -848,6 +859,8 @@ def divide(*inputs):
     if not isinstance(inputs[1], Variable):
         raise Exception("Unknown input: " + str(inputs[1]))
     return [DivideModule(*inputs)]
+register_module("divide", divide)
+
 class AddModule(Module):
     def __init__(self, inputs):
         Module.__init__(self, inputs, Variable(inputs[0].type, inputs[0].num_features, self))
@@ -857,13 +870,14 @@ class AddModule(Module):
         for input in inputs[1:]:
             res += input
         return res, [], []
-def add(*inputs):
+def add(rng, *inputs):
     if len(inputs) < 1:
         raise Exception("Invalid number of inputs in add function")
     for input in inputs:
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [AddModule(inputs)]
+register_module("add", add)
 
 class UnitNormModule(Module):
     def __init__(self, input):
@@ -871,12 +885,13 @@ class UnitNormModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == 1
         return inputs[0] / (numpy.float32(1e-10) + T.sqrt(T.sum(inputs[0] * inputs[0], axis=1)).dimshuffle((0, 'x'))), [], []
-def unit_norm(*inputs):
+def unit_norm(rng, *inputs):
     if len(inputs) != 1:
         raise Exception("Invalid number of inputs in unit_norm function")
     if not isinstance(inputs[0], Variable):
         raise Exception("Unknown input: " + str(input))
     return [UnitNormModule(inputs[0])]
+register_module("unit_norm", unit_norm)
 
 class SubModule(Module):
     def __init__(self, inputs):
@@ -885,161 +900,188 @@ class SubModule(Module):
     def train_fprop(self, inputs):
         assert len(inputs) == 2
         return inputs[0] - inputs[1], [], []
-def sub(*inputs):
+def sub(rng, *inputs):
     if len(inputs) != 2:
         raise Exception("Wrong number of inputs to dot: {}. Should be 2".format(len(inputs)))
     for input in inputs:
         if not isinstance(input, Variable):
             raise Exception("Unknown input: " + str(input))
     return [SubModule(inputs)]
+register_module("sub", sub)
 
-class MseEnergy(Module):
-    def __init__(self, model, transformer=None):
-        inputs = (model.get_inputs(), Variable("dense", name="targets",
-            transformer=transformer), Variable("dense", name="weights"))
-        Module.__init__(self, inputs, Variable("dense"))
-        self.model = model
-    def train_fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output, model_dynamic_params, model_dynamic_penalized_params =\
-            self.model.train_fprop(model_inputs)
-        targets = inputs[1]
-        weights = inputs[2]
-        return T.sum(weights * T.sqr(targets - model_output)) / T.sum(abs(weights)), \
-            model_dynamic_params, model_dynamic_penalized_params
-    def fprop(self, inputs):
-        model_inputs = inputs[0]
-        targets = inputs[1]
-        weights = inputs[2]
-        model_output = self.model.fprop(model_inputs)
-        return T.sum(weights * T.sqr(targets - model_output)) / T.sum(abs(weights))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
+
 class GaussianEnergy(Module):
-    def __init__(self, model, transformer=None):
-        inputs = (model.get_inputs(), Variable("dense", name="targets",
-            transformer=transformer), Variable("dense", name="weights"))
-        Module.__init__(self, inputs, Variable("dense"))
-        self.model = model
+    def __init__(self, predictions, targets, weights):
+        inputs = [predictions]
+        if isinstance(targets, float):
+            self.target = numpy.float32(targets)
+        else:
+            inputs.append(targets)
+            self.target = None
+        if weights is not None:
+            self.weights = "not none"
+            inputs.append(weights)
+        else:
+            self.weights = None
+        Module.__init__(self, inputs, Variable("dense", 1, self))
     def train_fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output, model_dynamic_params, model_dynamic_penalized_params =\
-            self.model.train_fprop(model_inputs)
-        targets = inputs[1].ravel()
-        weights = inputs[2].ravel()
-        means = model_output[:, 0].ravel()
-        stds = model_output[:, 1].ravel()
+        predictions = inputs[0]
+        means = predictions[:, 0].ravel()
+        stds = predictions[:, 1].ravel()
+        if self.target is not None:
+            targets = self.target
+        else:
+            targets = inputs[1]
         energies = numpy.float32(0.5) * T.sqr((targets - means) / (numpy.float32(1e-10) + stds)) + T.log(stds + 1e-10)
-        return T.sum(weights * energies / T.sum(abs(weights))), \
-            model_dynamic_params, model_dynamic_penalized_params
-    def fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output = self.model.fprop(model_inputs)
-        targets = inputs[1].ravel()
-        weights = inputs[2].ravel()
-        means = model_output[:, 0].ravel()
-        stds = model_output[:, 1].ravel()
-        energies = numpy.float32(0.5) * T.sqr((targets - means) / (numpy.float32(1e-10) + stds)) + T.log(stds + 1e-10)
-        return T.sum(weights * energies / T.sum(abs(weights)))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
-class CrossEntropyEnergy(Module):
-    def __init__(self, model, transformer=None):
-        inputs = (model.get_inputs(), Variable("dense", name="targets",
-            transformer=transformer), Variable("dense", name="weights"))
-        Module.__init__(self, inputs, Variable("dense"))
-        self.model = model
+        if self.weights is not None:
+            weights = inputs[-1]
+            return T.sum(weights * energies / T.sum(abs(weights))), [], []
+        else:
+            return T.mean(energies), [], []
+def gaussian_energy(rng, predictions, targets, weights):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in gaussian_energy): " + str(predictions))
+    if not isinstance(targets, Variable):
+        try:
+            targets = float(targets)
+        except ValueError:
+            raise Exception("Unknown input (targets in gaussian_energy): " + str(targets))
+    if weights is not None and not isinstance(weights, Variable):
+        raise Exception("Unknown input: " + str(weights))
+register_module("gaussian_energy", gaussian_energy)
+
+
+class Mse(Module):
+    def __init__(self, predictions, targets, weights):
+        inputs = [predictions]
+        if isinstance(targets, float):
+            self.target = numpy.float32(targets)
+        else:
+            inputs.append(targets)
+            self.target = None
+        if weights is not None:
+            self.weights = "not none"
+            inputs.append(weights)
+        else:
+            self.weights = None
+        Module.__init__(self, inputs, Variable("dense", 1, self))
     def train_fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output, model_dynamic_params, model_dynamic_penalized_params =\
-            self.model.train_fprop(model_inputs)
-        targets = inputs[1]
-        weights = inputs[2]
-        return -T.sum(weights * (targets * T.log(model_output + numpy.float32(1e-10)) +
-            (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - model_output))) / T.sum(abs(weights)), \
-            model_dynamic_params, model_dynamic_penalized_params
-    def fprop(self, inputs):
-        model_inputs = inputs[0]
-        targets = inputs[1]
-        weights = inputs[2]
-        model_output = self.model.fprop(model_inputs)
-        return -T.sum(weights * (targets * T.log(model_output + numpy.float32(1e-10)) +
-            (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - model_output) )) / T.sum(abs(weights))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
-class MyersonEnergy(Module):
-    def __init__(self, model, transformer=None):
-        inputs = (model.get_inputs(), Variable("dense", name="targets",
-            transformer=transformer), Variable("dense", name="weights"))
-        Module.__init__(self, inputs, Variable("dense"))
-        self.model = model
+        predictions = inputs[0]
+        if self.target is not None:
+            targets = self.target
+        else:
+            targets = inputs[1]
+        if self.weights is not None:
+            weights = inputs[-1]
+            return T.sum(weights * T.sqr(targets - predictions)) / T.sum(abs(weights)), [], []
+        else:
+            return T.mean(T.sqr(targets - predictions)), [], []
+def mse(rng, predictions, targets, weights=None):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in mse): " + str(predictions))
+    if not isinstance(targets, Variable):
+        try:
+            targets = float(targets)
+        except ValueError:
+            raise Exception("Unknown input (targets in mse): " + str(targets))
+    if weights is not None and not isinstance(weights, Variable):
+        raise Exception("Unknown input: " + str(weights))
+    return [Mse(predictions, targets, weights)]
+register_module("mse", mse)
+
+
+class CrossEntropy(Module):
+    def __init__(self, predictions, targets, weights):
+        inputs = [predictions]
+        if isinstance(targets, float):
+            self.target = numpy.float32(targets)
+        else:
+            inputs.append(targets)
+            self.target = None
+        if weights is not None:
+            self.weights = "not none"
+            inputs.append(weights)
+        else:
+            self.weights = None
+        Module.__init__(self, inputs, Variable("dense", 1, self))
     def train_fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output, model_dynamic_params, model_dynamic_penalized_params =\
-            self.model.train_fprop(model_inputs)
-        targets = inputs[1]
-        weights = inputs[2]
-        return T.sum(weights * ((targets >= model_output) * (targets - model_output) +
-                (targets < model_output) * (targets - targets * T.exp(targets - model_output)))) / T.sum(abs(weights)), \
-                model_dynamic_params, model_dynamic_penalized_params
-    def fprop(self, inputs):
-        model_inputs = inputs[0]
-        targets = inputs[1]
-        weights = inputs[2]
-        model_output = self.model.fprop(model_inputs)
-        return -T.sum(weights * (targets >= model_output) * model_output) / T.sum(abs(weights))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
-class AccuracyEnergy(Module):
-    def __init__(self, model, transformer=None):
-        inputs = (model.get_inputs(), Variable("dense", name="targets",
-            transformer=transformer), Variable("dense", name="weights"))
-        Module.__init__(self, inputs, Variable("dense"))
-        self.model = model
+        predictions = inputs[0]
+        if self.target is not None:
+            targets = self.target
+        else:
+            targets = inputs[1]
+        if self.weights is not None:
+            weights = inputs[-1]
+            return -T.sum(weights * (targets * T.log(predictions + numpy.float32(1e-10)) +
+                (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - predictions))) / T.sum(abs(weights)),[],[]
+        else:
+            return -T.mean((targets * T.log(predictions + numpy.float32(1e-10)) +
+                (numpy.float32(1) - targets) * T.log(numpy.float32(1.0000001) - predictions))), [], []
+
+def cross_entropy(rng, predictions, targets, weights=None):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in cross_entropy): " + str(predictions))
+    if not isinstance(targets, Variable):
+        try:
+            targets = float(targets)
+        except ValueError:
+            raise Exception("Unknown input (targets in cross_entropy): " + str(targets))
+    if weights is not None and not isinstance(weights, Variable):
+        raise Exception("Unknown input: " + str(weights))
+    return [CrossEntropy(predictions, targets, weights)]
+register_module("cross_entropy", cross_entropy)
+
+
+class ErrorRate(Module):
+    def __init__(self, predictions, targets, weights=None):
+        inputs = [predictions]
+        if isinstance(targets, float):
+            self.target = numpy.float32(targets)
+        else:
+            inputs.append(targets)
+            self.target = None
+        if weights is not None:
+            self.weights = "not none"
+            inputs.append(weights)
+        else:
+            self.weights = None
+        Module.__init__(self, inputs, Variable("dense", 1, self))
     def train_fprop(self, inputs):
-        model_inputs = inputs[0]
-        model_output, model_dynamic_params, model_dynamic_penalized_params =\
-            self.model.train_fprop(model_inputs)
-        targets = inputs[1]
-        weights = inputs[2]
+        predictions = inputs[0]
+        if self.target is not None:
+            targets = self.target
+        else:
+            targets = inputs[1]
 
         # this expression assumes that there is just one output with everything
         #   above 0.5 positive (common assumption for binary classification)
         # if there are more outputs, there are more possible options - currently this is not implemented
-        return T.sum(weights * (targets == (model_output > numpy.float32(0.5)))) / T.sum(abs(weights)), \
-            model_dynamic_params, model_dynamic_penalized_params
-    def fprop(self, inputs):
-        model_inputs = inputs[0]
-        targets = inputs[1]
-        weights = inputs[2]
-        model_output = self.model.fprop(model_inputs)
-        return T.sum(weights * (targets == (model_output > numpy.float32(0.5)))) / T.sum(abs(weights))
-    def get_params(self):
-        return self.model.get_params()
-    def get_penalized_params(self):
-        return self.model.get_penalized_params()
+        if self.weights is not None:
+            weights = inputs[-1]
+            return numpy.float32(1.0) - T.sum(weights * (targets == (predictions > numpy.float32(0.5)))) / T.sum(abs(weights)), [], []
+        else:
+            return numpy.float32(1.0) - T.mean(numpy.float32(1.0) * (targets == (predictions > numpy.float32(0.5)))), [], []
+def error_rate(rng, predictions, targets, weights=None):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in error_rate): " + str(predictions))
+    if not isinstance(targets, Variable):
+        try:
+            targets = float(targets)
+        except ValueError:
+            raise Exception("Unknown input (targets in error_rate): " + str(targets))
+    if weights is not None and not isinstance(weights, Variable):
+        raise Exception("Unknown input: " + str(weights))
+    return [Accuracy(predictions, targets, weights)]
+register_module("error_rate", error_rate)
 
-# --------------------------core model---------------------------------------
+
+# --------------------------core components---------------------------------------
+
 
 class FuncWrapperModule(Module):
     def __init__(self, func_module, inputs):
-        assert len(inputs) == len(func_module.get_defined_inputs())
-        func_module_inputs = list(func_module.get_inputs())
-        for input, func_input in zip(inputs, func_module.get_defined_inputs()):
-            if func_input in func_module_inputs:
-                func_module_inputs[func_module_inputs.index(func_input)] = input
-            else:
-                raise Exception("A function takes variable {}, but does not use it".format(func_input.name))
         output = func_module.get_output()
-        Module.__init__(self, func_module_inputs, Variable(output.type, output.num_features, self))
+        Module.__init__(self, inputs, Variable(output.type, output.num_features, self))
         self.func_module = func_module
     def train_fprop(self, inputs):
         assert len(inputs) == len(self.get_inputs())
@@ -1050,6 +1092,7 @@ class FuncWrapperModule(Module):
         return self.func_module.get_params()
     def get_penalized_params(self):
         return self.func_module.get_penalized_params()
+
 
 class FuncModule(Module):
     def __init__(self, inputs, output, toposorted_modules, defined_inputs=None):
@@ -1062,11 +1105,7 @@ class FuncModule(Module):
                 if not isinstance(input, Variable):
                     raise Exception("Incorrect input specified: {}".format(input))
                 if input.name not in inputs_map and input not in intermediates:
-                    if isinstance(module, FuncWrapperModule):
-                        # func wrapper hid this input
-                        inputs.append(input)
-                    else:
-                        raise Exception("Strange input: name {}, variable {}, module {}".format(input.name, input, module))
+                    raise Exception("Strange input: name {}, variable {}, module {}".format(input.name, input, module))
             intermediates.add(module.get_output())
         Module.__init__(self, inputs, output)
         self.defined_inputs = defined_inputs
@@ -1107,6 +1146,7 @@ class FuncModule(Module):
         for module in self.toposorted_modules:
             params |= set(module.get_penalized_params())
         return list(params)
+
 
 class UnnComputer(Module):
     def __init__(self, func):
@@ -1152,8 +1192,23 @@ class Unn(object):
         unravel_computer(output_var)
         func = FuncModule(list(inputs), output_var, toposorted_modules)
         return UnnComputer(func)
+    def save(self, path):
+        with unique_tempdir() as tmpdir:
+            tmp_model_path = os.path.join(tmpdir, "model.net")
+            with open(tmp_model_path, "w") as f:
+                pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
+            for i in range(100):
+                try:
+                    shutil.move(tmp_model_path, path)
+                    break;
+                except IOError:
+                    pass
+        sys.stdout.write("Model saved\n")
+
 
 # --------------------------- expression parsing -----------------------
+
+
 def get_name_and_inputs(func_definition):
     func_name, inputs = func_definition.split("(", 1)
     if not inputs.endswith(")"):
@@ -1177,6 +1232,8 @@ def get_name_and_inputs(func_definition):
     if last_pos != len(inputs):
         input_expressions.append(inputs[last_pos:len(inputs)])
     return func_name, input_expressions
+
+
 def make_function(function_string, known_funcs, rng, external_variables=None):
     if function_string.count("=") != 1:
         raise Exception("Invalid function definition: " + function_string)
@@ -1189,9 +1246,9 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
 
     # parse func definition
     if "(" in func_definition:
-        new_func_name, func_inputs = func_definition.strip(")").split("(")
-        if "(" in new_func_name:
-            raise Exception("Invalid function name: " + new_func_name)
+        if not func_definition.endswith(")") or func_definition.count("(") != 1 or func_definition.count(")") != 1:
+            raise Exception("Invalid function definition: " + func_definition)
+        new_func_name, func_inputs = func_definition[:-1].split("(")
         if new_func_name == "":
             raise Exception("Function name should not be empty!")
         if new_func_name in known_funcs:
@@ -1223,6 +1280,9 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
 
             if name in inputs_names or name in external_variables:
                 raise Exception("Duplicate input name: " + name)
+            if name in external_variables:
+                raise Exception("Variable " + name + " specified as input to function " + new_func_name + \
+                    " hides a variable or function with the same name in the outer scope. Use another name - this reduces the probability of error")
             inputs_names.add(name)
 
             func_inputs[idx] = Variable(name=name, type=type, num_features=num_features)
@@ -1230,6 +1290,7 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
         new_func_name = func_definition
         func_inputs = []
 
+    # function has implicit inputs that are variables from the outer scope and explicit - specified in the function definition
     defined_func_inputs = list(func_inputs)
 
     # parse func expression
@@ -1249,63 +1310,67 @@ def make_function(function_string, known_funcs, rng, external_variables=None):
                 inputs.append(external_variables[var_name])
                 input_map[var_name] = external_variables[var_name]
                 func_inputs.append(input_map[var_name])
+                assert input_map[var_name].name == var_name
             else:
                 inputs.append(input_str)
         if func_name in known_funcs:
-            modules = [FuncWrapperModule(known_funcs[func_name], inputs)]
-        elif func_name == "rlu":
-            modules = rlu(rng, *inputs)
-        elif func_name == "sigmoid":
-            modules = sigmoid(rng, *inputs)
-        elif func_name == "tanh":
-            modules = tanh(rng, *inputs)
-        elif func_name == "linear":
-            modules = linear(rng, *inputs)
-        elif func_name == "exp":
-            modules = exp(rng, *inputs)
-        elif func_name == "concat":
-            modules = concat(*inputs)
-        elif func_name == "dot":
-            modules = dot(*inputs)
-        elif func_name == "scale":
-            modules = scale(*inputs)
-        elif func_name == "signed_sqrt":
-            modules = signed_sqrt(rng, *inputs)
-        elif func_name == "sub":
-            modules = sub(*inputs)
-        elif func_name == "cosine_distance":
-            modules = cosine_distance(*inputs)
-        elif func_name == "unit_norm":
-            modules = unit_norm(*inputs)
-        elif func_name == "autoscale":
-            modules = autoscale(*inputs)
-        elif func_name == "divide":
-            modules = divide(*inputs)
-        elif func_name == "add":
-            modules = add(*inputs)
+            assert len(inputs) == len(known_funcs[func_name].get_defined_inputs())
+            subfunc_inputs = []
+            for input in known_funcs[func_name].get_inputs():
+                if input in known_funcs[func_name].get_defined_inputs():
+                    subfunc_inputs.append(inputs[0])
+                    inputs = inputs[1:]
+                else:
+                    assert input.name is not None
+                    assert input.name in external_variables
+                    if input.name not in input_map:
+                        assert input.name is not None
+                        input_map[input.name] = input
+                        func_inputs.append(input)
+                    subfunc_inputs.append(input)
+            modules = [FuncWrapperModule(known_funcs[func_name], subfunc_inputs)]
+        elif func_name in modules_map:
+            modules = modules_map[func_name](rng, *inputs)
         else:
             raise Exception("Unknown function: {}".format(func_name))
         toposorted_modules.extend(modules)
         return modules[-1].get_output()
     output = sub_make_function(function_expression)
     return new_func_name, FuncModule(func_inputs, output, toposorted_modules, defined_func_inputs)
-def build_unn(input_variables, architecture_string):
+
+
+def build_unn(input_variables, architecture_string, existing_unn=None):
     modules = architecture_string.split("|")
-    inputs_map = {}
+    var_map = {}
     for variable in input_variables:
-        inputs_map[variable.name] = variable
-    funcs = {}
+        var_map[variable.name] = variable
+    if existing_unn is not None:
+        funcs = existing_unn.funcs
+        for func_name in funcs:
+            # support for old models with this problem
+            funcs[func_name].get_output().name = func_name
+
+            var_map[func_name] = funcs[func_name].get_output()
+        modules = architecture_string.split("|")
+        architecture_string = existing_unn.architecture_string + "|" + architecture_string
+    else:
+        funcs = {}
     rng = numpy.random.RandomState(0)
     for function_string in modules:
-        func_name, func_module = make_function(function_string, funcs, rng, inputs_map)
-        assert func_name not in funcs
+        func_name, func_module = make_function(function_string, funcs, rng, var_map)
+        if func_name in funcs:
+            raise Exception("Duplicate function definition: " + func_name)
         funcs[func_name] = func_module
-        assert func_name not in inputs_map
-        inputs_map[func_name] = func_module.get_output()
+        if func_name in var_map:
+            raise Exception("Duplicate function definition: " + func_name)
+        func_module.get_output().name = func_name
+        var_map[func_name] = func_module.get_output()
     output_name = func_name
     return Unn(funcs, input_variables, output_name, architecture_string)
 
+
 # --------------------------- data processing---------------------
+
 
 class SparseMatrixBuilder(object):
     def __init__(self, num_features, capacity):
@@ -1338,6 +1403,8 @@ class SparseMatrixBuilder(object):
         return scipy.sparse.csr_matrix((self.vals[:self.pos],
             (self.rows[:self.pos], self.columns[:self.pos])),
             shape=(self.row, self.num_features))
+
+
 class DenseMatrixBuilder(object):
     def __init__(self, num_features, num_samples, dtype=numpy.float32):
         self.array = numpy.zeros([num_samples, num_features], dtype=dtype)
@@ -1348,6 +1415,7 @@ class DenseMatrixBuilder(object):
         self.pos += 1
     def get(self):
         return self.array[:self.pos]
+
 
 # Weights in sgd are a problem. What if one sample is extremely important?
 # If samples are taken uniformly, this will lead to an extremely large
@@ -1361,12 +1429,15 @@ class RandomDatasetIterator(object):
             if var.name == "weights":
                 weights_pos =  idx
                 break
-        if (weights_pos < 0):
-            raise Exception("No weights in dataset")
+        num_samples = dataset.arrays[0].shape[0]
 
-        self.cumsum = numpy.cumsum(abs(dataset.arrays[weights_pos]) * 1.0 / sum(abs(dataset.arrays[weights_pos])))
+        if weights_pos < 0:
+            self.cumsum = range(1,num_samples + 1) * 1.0 / num_samples
+        else:
+            self.cumsum = numpy.cumsum(abs(dataset.arrays[weights_pos]) * 1.0 / sum(abs(dataset.arrays[weights_pos])))
+
         self.cumsum[-1] = 1
-        self.num_batches = math.ceil(dataset.arrays[0].shape[0] * 1.0 / batch_size)
+        self.num_batches = math.ceil(num_samples * 1.0 / batch_size)
         self.batch_size = batch_size
         self.dataset = dataset
         self.pos = 0
@@ -1385,7 +1456,8 @@ class RandomDatasetIterator(object):
                     res[var.name] = weights
                 else:
                     res[var.name] = array[samples_ids]
-            return res
+            return (len(samples_ids), res)
+
 
 class SequentialDatasetIterator(object):
     def __init__(self, dataset, batch_size):
@@ -1403,8 +1475,10 @@ class SequentialDatasetIterator(object):
             res = {}
             for var, array in zip(self.dataset.input_vars, self.dataset.arrays):
                 res[var.name] = array[self.pos:next_pos]
+            num_samples = next_pos - self.pos
             self.pos = next_pos
-            return res
+            return (num_samples, res)
+
 
 class MemoryDataset(object):
     def __init__(self, arrays, input_vars, use_random_iterator):
@@ -1418,6 +1492,7 @@ class MemoryDataset(object):
             return SequentialDatasetIterator(self, batch_size)
     def read(self, batch_size):
         return SequentialDatasetIterator(self, batch_size)
+
 
 class FileIterator(object):
     def __init__(self, input_file, input_vars, batch_size):
@@ -1436,33 +1511,33 @@ class FileIterator(object):
             else:
                 arrays.append(None)
 
-        have_data = False
+        num_samples = 0
         for idx, line in enumerate(self.input_file):
-            have_data = True
+            num_samples += 1
             entries = line.strip("\n").split("\t")
             for input_idx, entry in enumerate(entries):
                 if arrays[input_idx] is not None:
                     arrays[input_idx].append_row(entry)
             if idx + 1 >= self.batch_size:
                 break
-        if have_data:
+        if num_samples != 0:
             res = {}
             for var, data in zip(self.input_vars, arrays):
                 if data is not None:
                     res[var.name] = data.get()
-            return res
+            return (num_samples, res)
         else:
             raise StopIteration()
 
 
-def prepare_batch(input_vars, batch_size, lines):
+def prepare_batch(input_vars, lines):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     arrays = []
     for input_var in input_vars:
         if input_var.type == "sparse":
-            arrays.append(SparseMatrixBuilder(input_var.num_features, batch_size))
+            arrays.append(SparseMatrixBuilder(input_var.num_features, len(lines)))
         elif input_var.type == "dense":
-            arrays.append(DenseMatrixBuilder(input_var.num_features, batch_size))
+            arrays.append(DenseMatrixBuilder(input_var.num_features, len(lines)))
         else:
             arrays.append(None)
 
@@ -1475,7 +1550,7 @@ def prepare_batch(input_vars, batch_size, lines):
     for var, data in zip(input_vars, arrays):
         if data is not None:
             res[var.name] = data.get()
-    return res
+    return (len(lines), res)
 class AsyncFileIterator(object):
     def __init__(self, input_file, input_vars, batch_size, num_threads=1):
         self.init(input_file, input_vars, batch_size)
@@ -1546,7 +1621,7 @@ class AsyncFileIterator(object):
                 lines = self.batch_lines.get(block=True, timeout=3)
                 try:
                     active_tasks.append(self.workers.submit(prepare_batch,
-                        self.input_vars, self.batch_size, lines))
+                        self.input_vars, lines))
                 except Exception as ex:
                     if self.stopped:
                         for task in self.tasks:
@@ -1571,6 +1646,7 @@ class AsyncFileIterator(object):
                 if not self.batch_manager.is_alive():
                     raise StopIteration()
 
+
 class AsyncFileDataset(object):
     def __init__(self, input_file, input_vars, num_threads=1):
         import concurrent.futures
@@ -1593,6 +1669,7 @@ class AsyncFileDataset(object):
             self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
         return self.iter
 
+
 class FileDataset(object):
     def __init__(self, input_file, input_vars):
         self.input_file = input_file
@@ -1601,6 +1678,7 @@ class FileDataset(object):
         return FileIterator(self.input_file, self.input_vars, batch_size)
     def read(self, batch_size):
         return FileIterator(self.input_file, self.input_vars, batch_size)
+
 
 def get_transformer(transformer_name):
     if transformer_name == "scale":
@@ -1614,7 +1692,8 @@ def get_transformer(transformer_name):
     else:
         assert False
 
-def get_input_vars(inputs_specification, dataset_file):
+
+def get_input_vars(inputs_specification, dataset_file=None):
     input_vars = []
     inputs_names = set()
     inputs_specs = inputs_specification.split(",")
@@ -1622,6 +1701,8 @@ def get_input_vars(inputs_specification, dataset_file):
         entries = spec.split("@")[0].split(":")
         if len(entries) > 3:
             raise Exception("Wrong number of fields in input specification: {}. Should be: name[:type:num_features@transformer]".format(spec))
+        if dataset_file is None and len(entries) != 3:
+            raise Exception("Wrong number of fields in input specification: {}. Should be: name:type:num_features[@transformer]".format(spec))
         name = entries[0]
         if name in inputs_names:
             raise Exception("Duplicate input: " + name)
@@ -1671,15 +1752,17 @@ def get_input_vars(inputs_specification, dataset_file):
             spec = entries[0]
         else:
             if var.type == "dense":
-                transform_name = "scale"
+                # was scale, changed to none so that targets or weights were not accidentaly scaled
+                transform_name = "none"
             else:
                 transform_name = "none"
         if transform_name not in ["none", "pca", "scale", "minmax"]:
             raise Exception("Unknown transformer name: " + transform_name)
-        var.transformer = get_transformer(transform_name)
-        if var.type == "sparse" and var.transformer is not None:
+        var.transformer_name = None if transform_name == "none" else transform_name
+        if var.type == "sparse" and var.transformer_name is not None:
             raise Exception("Transformer cannot be used with a sparse input '{}'".format(input_var.name))
     return input_vars
+
 
 def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
     with open(file_) as f:
@@ -1709,7 +1792,9 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
 
     return MemoryDataset(arrays, input_vars, use_random_iterator)
 
+
 #--------------------------------modes-----------------------------------
+
 
 class Object(object):
     pass
@@ -1732,22 +1817,21 @@ def learn():
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     parser.add_argument('-i', "--inputs",
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
-            "Names 'targets' and 'weights' are reserved."
             "Entry 'num_features' is optional for dense input. Entry 'type' for dense input is optional - it will be inferred from "
-            "the data. Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - scale) is valid only for dense input")
+            "the data. Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - none) is valid only for dense input")
     parser.add_argument('--sb', "--start_batch", dest="start_batch",
         help="Start batch. In case previous run failed", type=int, default=0)
 
     # unn architecture
     parser.add_argument("-a", "--architecture", help="architecture of the network. Format <func>|<func>|...|<func>"
         " where <func> can be <func_name>(<input_name>:<type>:<num_features>,...)=func_expression(input_name) (use this to create shared modules)"
-        " or <output_name>=func_expression. The last <func> is model output")
-    parser.add_argument("--loss", choices=["mse", "cross_entropy", "myerson", "gauss"], help="Loss function", default="mse")
-    parser.add_argument("--vloss", dest="validation_loss", choices=["accuracy", "mse", "cross_entropy", "myerson", "gauss"],
-        help="Validation loss (specify if you want it be different from train loss). Currently 'accuracy' supports just one output", default=None)
+        " or <output_name>=func_expression. The last <func> is the default model output")
+    parser.add_argument("--te", "--train_energy", dest="train_energy", help="variable to minimize by tuning the parameters", default="energy")
+    parser.add_argument("--ve", "--val_energy", dest="val_energy", help="variable to use for validation", default=None)
+    parser.add_argument("--save", help="Ignore validation and always save the newest model", action="store_const", const=True, default=False)
 
     # learning parameters
-    parser.add_argument("--epochs", type=int, default=100,
+    parser.add_argument("--epochs", type=int, default=10000,
                         help="Number of training epochs. Each epoch is one pass through the train dataset")
     parser.add_argument("--batch_size", type=int, default=30,
                         help="Batch size")
@@ -1764,6 +1848,7 @@ def learn():
                         help="momentum. Valid for nesterov and sgd optimizers")
     parser.add_argument("--lr", "--learning_rate", dest="learning_rate", type=float, default=0.1,
                         help="learning rate. Valid for nesterov and sgd optimizers")
+    # thanks to theano adadelta is extremely slow (reason not clear)
     parser.add_argument("--decay", type=float, default=0.95,
                         help="Valid for adadelta optimizer")
     parser.add_argument("--eps", "--eps", type=float, default=1e-5,
@@ -1771,28 +1856,19 @@ def learn():
 
     args = parser.parse_args()
 
-    if args.validation_loss is None:
-        args.validation_loss = args.loss
+    if args.val_energy is None:
+        args.val_energy = args.train_energy
 
     if not os.path.exists(args.train):
         raise Exception("Train file is missing")
-    if args.test is None or not os.path.exists(args.test):
+    if args.test is None:
         print "Warning: no validation. The model will be saved each {} batches".format(args.val_freq)
-    else:
-        if not os.path.exists(args.test):
-            raise Exception("Train file is missing")
+    elif not os.path.exists(args.test):
+        raise Exception("Validation file does not exist")
 
     args.inputs = "".join(args.inputs.split())
     args.architecture = "".join(args.architecture.split())
-
-    with open(args.train) as f:
-        entries = f.readline().split("\t")
-        if len(entries) < 3:
-            raise Exception("Not enough inputs in the train file")
-        num_targets = len(entries[0].split(" "))
-        num_weights = len(entries[1].split(" "))
-        if num_weights != 1:
-            raise Exception("There should be 1 weight for each input sample in the train file")
+    model_input_vars = get_input_vars(args.inputs, args.train)
 
     print "Loading the model"
     if args.continue_learning:
@@ -1804,39 +1880,43 @@ def learn():
         except Exception as ex:
             sys.stderr.write("Cannot load the model: {}".format(ex))
             raise
-        print "Warning: input definitions are reused from the previous runs."
-        model_input_vars = unn.inputs
+        unn_inputs = {}
+        for input in unn.inputs:
+            unn_inputs[input.name] = input
+        for input in model_input_vars:
+            assert input.name in unn_inputs
+            assert input.type == unn_inputs[input.name].type
+            assert input.num_features == unn_inputs[input.name].num_features
+            assert not hasattr(unn_inputs[input.name], "transformer_name") or input.transformer_name == unn_inputs[input.name].transformer_name
     else:
         if os.path.exists(args.model_path):
             raise Exception("Model file exists! The old file will not be overriden")
-
-        input_specs = "targets:dense:{},weights:dense:1,".format(num_targets) + args.inputs
-        model_input_vars = get_input_vars(input_specs, args.train)[2:]
         unn = build_unn(model_input_vars, args.architecture)
 
-    # AsyncFileDataset spawns new subprocesses and causes memory error
+    if args.train_energy not in unn.funcs:
+        raise Exception("Train energy variable is unknown")
+    if args.test is not None:
+        if args.val_energy not in unn.funcs:
+            raise Exception("Train energy variable is unknown")
+    # if unn is large, it may cause MemoryError while forking
     del unn
-
-    actual_input_vars = copy.copy(model_input_vars)
-    actual_input_vars.insert(0, Variable(name="weights", type="dense", num_features=1))
-    actual_input_vars.insert(0, Variable(name="targets", type="dense", num_features=num_targets))
 
     print "reading train"
     assert not args.use_random_iterator or args.keep_train_in_memory
     if args.keep_train_in_memory:
-        train_dataset = load_dataset_from_file(args.train, actual_input_vars, args.use_random_iterator)
+        train_dataset = load_dataset_from_file(args.train, model_input_vars, args.use_random_iterator)
     elif args.train_async_file_reader_num_threads != 0:
-        train_dataset = AsyncFileDataset(args.train, actual_input_vars, args.train_async_file_reader_num_threads)
+        train_dataset = AsyncFileDataset(args.train, model_input_vars, args.train_async_file_reader_num_threads)
     else:
-        train_dataset = FileDataset(args.train, actual_input_vars)
+        train_dataset = FileDataset(args.train, model_input_vars)
     print "reading validation"
     if args.test is not None:
         if args.keep_validation_in_memory:
-            validation_dataset = load_dataset_from_file(args.test, actual_input_vars)
+            validation_dataset = load_dataset_from_file(args.test, model_input_vars)
         elif args.test_async_file_reader_num_threads != 0:
-            validation_dataset = AsyncFileDataset(args.test, actual_input_vars, args.test_async_file_reader_num_threads)
+            validation_dataset = AsyncFileDataset(args.test, model_input_vars, args.test_async_file_reader_num_threads)
         else:
-            validation_dataset = FileDataset(args.test, actual_input_vars)
+            validation_dataset = FileDataset(args.test, model_input_vars)
     else:
         validation_dataset = None
 
@@ -1850,32 +1930,9 @@ def learn():
             raise
     else:
         unn = build_unn(model_input_vars, args.architecture)
-
-    learn_model = unn.get_computer()
-    if args.loss == "mse":
-        train_energy = MseEnergy(learn_model)
-    elif args.loss == "cross_entropy":
-        train_energy = CrossEntropyEnergy(learn_model)
-    elif args.loss == "myerson":
-        train_energy = MyersonEnergy(learn_model)
-    elif args.loss == "gauss":
-        train_energy = GaussianEnergy(learn_model)
-    else:
-        assert False
-
+    train_energy = unn.get_computer(args.train_energy)
     if validation_dataset is not None:
-        if args.validation_loss == "mse":
-            validation_energy = MseEnergy(learn_model)
-        elif args.validation_loss == "cross_entropy":
-            validation_energy = CrossEntropyEnergy(learn_model)
-        elif args.validation_loss == "accuracy":
-            validation_energy = AccuracyEnergy(learn_model)
-        elif args.validation_loss == "myerson":
-            validation_energy = MyersonEnergy(learn_model)
-        elif args.validation_loss == "gauss":
-            validation_energy = GaussianEnergy(learn_model)
-        else:
-            assert False
+        validation_energy = unn.get_computer(args.val_energy)
     else:
         validation_energy = None
 
@@ -1890,24 +1947,65 @@ def learn():
 
     trainer = Trainer(updater_params=updater_params,
         num_epochs=args.epochs, reg_lambda=args.reg_lambda, batch_size=args.batch_size,
-        validation_frequency=args.val_freq, loss_function=args.loss, optimizer=args.optimizer)
+        validation_frequency=args.val_freq, optimizer=args.optimizer)
 
     print "Learning with {} optimizer".format(args.optimizer)
     trainer.fit(model=unn, train_energy=train_energy,
         validation_energy=validation_energy, save_path=args.model_path,
         train_dataset=train_dataset, validation_dataset=validation_dataset,
-        continue_learning=args.continue_learning, start_batch=args.start_batch)
+        continue_learning=args.continue_learning, always_save=args.save, start_batch=args.start_batch)
     print "Finished"
+
+
+def add_new_modules():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", "--src_model_path", dest="src_model_path", required=True)
+    parser.add_argument("--dst", "--dst_model_path", dest="dst_model_path", required=True)
+    parser.add_argument('-i', "--inputs",
+            help="Additional inputs names. Format: <name>:<type>:<num_features>@<preprocessor>,<name>:<type>:<num_features>@<preprocessor>. "
+                "Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - none) is valid only for dense input")
+
+    # unn architecture
+    parser.add_argument("-a", "--architecture", help="New operations to add to the model. Format <func>|<func>|...|<func>"
+        " where <func> can be <func_name>(<input_name>:<type>:<num_features>,...)=func_expression(input_name) (use this to create shared modules)"
+        " or <output_name>=func_expression)")
+
+    args = parser.parse_args()
+    assert os.path.exists(args.src_model_path)
+    try:
+        with open(args.src_model_path) as f:
+            unn = pickle.load(f)
+        print "model was loaded from path " + args.src_model_path
+    except Exception as ex:
+        sys.stderr.write("Cannot load the model: {}".format(ex))
+        raise
+
+    new_inputs = get_input_vars(args.inputs)
+    model_input_vars = unn.inputs
+    model_inputs = set()
+    for input in model_input_vars:
+        model_inputs.add(input.name)
+    for input in new_inputs:
+        if input in model_inputs:
+            raise Exception("Input {} already defined".format(input.name))
+        else:
+            model_input_vars.append(input)
+
+    new_unn = build_unn(model_input_vars, args.architecture, unn)
+    new_unn.save(args.dst_model_path)
+
 
 def apply_model_to_data():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--model_path", default="model.net", required=True)
+    parser.add_argument("-m", "--model_path", required=True)
     parser.add_argument("-o", "--output", default=None,
         help="Which variable to output")
     parser.add_argument('-d', "--data", required=True,
         help="path to the dataset file")
     parser.add_argument('-i', "--inputs", help="csv inputs names")
     parser.add_argument('-f', "--output_file", help="file where to put the result", required=True)
+    parser.add_argument("--aff", dest="async_file_reader_num_threads",
+        help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     args = parser.parse_args()
 
     assert os.path.exists(args.model_path)
@@ -1931,9 +2029,10 @@ def apply_model_to_data():
             inputs.append(model_inputs[input])
         else:
             inputs.append(Variable(type=None, name="input"))
-    dataset = FileDataset(args.data, inputs)
+    dataset = AsyncFileDataset(args.data, inputs, num_threads=3)
     with open(args.output_file, "w") as of:
         apply_model(model, dataset, of)
+
 
 def describe_model():
     parser = argparse.ArgumentParser()
@@ -1957,11 +2056,15 @@ def describe_model():
         print "\tName={}; Type={}; Transformer={}; Number of features={}".format(
             var.name, var.type, var.transformer, var.num_features)
 
+
 def print_help():
     print "Usage:"
-    print "\tunn.py learn ... - learn a model"
+    print "\tunn.py learn ... - tune the parameters to minimize the output of a model"
     print "\tunn.py apply ... - apply model to data"
     print "\tunn.py describe ... - print model architecture"
+    print "\tunn.py add ... - add new operations to the architecture"
+
+
 def dispatch():
     if len(sys.argv) == 1 or len(sys.argv) == 2 and sys.argv[1] == "-h":
         print_help()
@@ -1976,6 +2079,8 @@ def dispatch():
             apply_model_to_data()
         elif mode == "describe":
             describe_model()
+        elif mode == "add":
+            add_new_modules()
         else:
             print "Unknown mode: {}".format(mode)
             print_help()
