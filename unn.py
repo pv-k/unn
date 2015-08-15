@@ -1195,13 +1195,23 @@ class Unn(object):
     def save(self, path):
         with unique_tempdir() as tmpdir:
             tmp_model_path = os.path.join(tmpdir, "model.net")
-            with open(tmp_model_path, "w") as f:
-                pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
             for i in range(100):
                 try:
-                    shutil.move(tmp_model_path, path)
-                    break;
-                except IOError:
+                    with open(tmp_model_path, "w") as f:
+                        pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
+                    for _ in range(10):
+                        try:
+                            shutil.move(tmp_model_path, path)
+                            break
+                        except Exception:
+                            pass
+                    # check if the model can be loaded
+                    with open(path) as f:
+                        pickle.load(f)
+                    break
+                except Exception as ex:
+                    sys.stderr.write("Saving failed: " + str(ex))
+                    time.sleep(1)
                     pass
         sys.stdout.write("Model saved\n")
 
@@ -1479,8 +1489,13 @@ class SequentialDatasetIterator(object):
             self.pos = next_pos
             return (num_samples, res)
 
+class Dataset(object):
+    def read_train(self, batch_size):
+        raise NotImplementedError()
+    def read(self, batch_size):
+        raise NotImplementedError()
 
-class MemoryDataset(object):
+class MemoryDataset(Dataset):
     def __init__(self, arrays, input_vars, use_random_iterator):
         self.arrays = arrays
         self.input_vars = input_vars
@@ -1496,7 +1511,7 @@ class MemoryDataset(object):
 
 class FileIterator(object):
     def __init__(self, input_file, input_vars, batch_size):
-        self.input_file = open(input_file)
+        self.input_file = input_file
         self.input_vars = input_vars
         self.batch_size = batch_size
     def __iter__(self):
@@ -1556,7 +1571,7 @@ class AsyncFileIterator(object):
         self.init(input_file, input_vars, batch_size)
         self.workers = concurrent.futures.ProcessPoolExecutor(num_threads)
     def init(self, input_file, input_vars, batch_size):
-        self.input_file = open(input_file)
+        self.input_file = input_file
         self.input_vars = input_vars
         self.batch_size = batch_size
         self.cache_size = max(1, math.ceil(1000000.0 / batch_size))
@@ -1647,7 +1662,7 @@ class AsyncFileIterator(object):
                     raise StopIteration()
 
 
-class AsyncFileDataset(object):
+class AsyncFileDataset(Dataset):
     def __init__(self, input_file, input_vars, num_threads=1):
         import concurrent.futures
         self.input_file = input_file
@@ -1669,15 +1684,39 @@ class AsyncFileDataset(object):
             self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
         return self.iter
 
+class AsyncStdinDataset(Dataset):
+    def __init__(self, input_vars, num_threads=1):
+        import concurrent.futures
+        self.input_vars = input_vars
+        self.iter = None
+        self.num_threads = num_threads
+    def read_train(self, batch_size):
+        # only one iterator may be active
+        assert self.iter is None
+        self.iter = AsyncFileIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
+        return self.iter
+    def read(self, batch_size):
+        assert self.iter is None
+        self.iter = AsyncFileIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
+        return self.iter
 
-class FileDataset(object):
+
+class FileDataset(Dataset):
     def __init__(self, input_file, input_vars):
         self.input_file = input_file
         self.input_vars = input_vars
     def read_train(self, batch_size):
-        return FileIterator(self.input_file, self.input_vars, batch_size)
+        return FileIterator(open(self.input_file), self.input_vars, batch_size)
     def read(self, batch_size):
-        return FileIterator(self.input_file, self.input_vars, batch_size)
+        return FileIterator(open(self.input_file), self.input_vars, batch_size)
+
+class StdinDataset(Dataset):
+    def __init__(self, input_vars):
+        self.input_vars = input_vars
+    def read_train(self, batch_size):
+        return FileIterator(sys.stdin, self.input_vars, batch_size)
+    def read(self, batch_size):
+        return FileIterator(sys.stdin, self.input_vars, batch_size)
 
 
 def get_transformer(transformer_name):
@@ -1765,17 +1804,18 @@ def get_input_vars(inputs_specification, dataset_file=None):
 
 
 def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
-    with open(file_) as f:
-        num_samples = sum(1 for line in f)
-
     arrays = []
     for input_var in input_vars:
         if input_var.type == "sparse":
-            arrays.append(SparseMatrixBuilder(input_var.num_features, num_samples))
+            arrays.append(SparseMatrixBuilder(input_var.num_features, 100))
         else:
-            arrays.append(DenseMatrixBuilder(input_var.num_features, num_samples))
-    with open(file_) as f:
-        for idx, line in enumerate(f):
+            arrays.append(DenseMatrixBuilder(input_var.num_features, 100))
+    if file_ is not None:
+        file_ = open(file_)
+    else:
+        file_ = sys.stdin
+    for line in file_:
+        for idx, line in enumerate(sys.stdin):
             if idx % 10000 == 0:
                 sys.stdout.write("\rreading sample {}".format(idx))
                 sys.stdout.flush()
@@ -1805,8 +1845,8 @@ def learn():
         default=False)
 
     # data specification
-    parser.add_argument('-f', "--train", required=True,
-        help="path to the learn dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
+    parser.add_argument('-f', "--train", default=None,
+        help="path to the learn dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...]). If not specfied - read from stdin")
     parser.add_argument("--mf", dest="keep_train_in_memory", help="read train data from memory", action="store_const", const=True, default=False)
     parser.add_argument("--aff", dest="train_async_file_reader_num_threads",
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
@@ -1817,8 +1857,8 @@ def learn():
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     parser.add_argument('-i', "--inputs",
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
-            "Entry 'num_features' is optional for dense input. Entry 'type' for dense input is optional - it will be inferred from "
-            "the data. Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - none) is valid only for dense input")
+            "Entry 'num_features' is optional for dense input. Entries 'type', 'num_features' for dense input are optional - they will be inferred from "
+            "the data (if train file is specified). Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - none) is valid only for dense input")
     parser.add_argument('--sb', "--start_batch", dest="start_batch",
         help="Start batch. In case previous run failed", type=int, default=0)
 
@@ -1859,7 +1899,7 @@ def learn():
     if args.val_energy is None:
         args.val_energy = args.train_energy
 
-    if not os.path.exists(args.train):
+    if not args.train is not None and not os.path.exists(args.train):
         raise Exception("Train file is missing")
     if args.test is None:
         print "Warning: no validation. The model will be saved each {} batches".format(args.val_freq)
@@ -1868,7 +1908,10 @@ def learn():
 
     args.inputs = "".join(args.inputs.split())
     args.architecture = "".join(args.architecture.split())
-    model_input_vars = get_input_vars(args.inputs, args.train)
+    if args.train is not None:
+        model_input_vars = get_input_vars(args.inputs)
+    else:
+        model_input_vars = get_input_vars(args.inputs, args.train)
 
     print "Loading the model"
     if args.continue_learning:
@@ -1906,9 +1949,15 @@ def learn():
     if args.keep_train_in_memory:
         train_dataset = load_dataset_from_file(args.train, model_input_vars, args.use_random_iterator)
     elif args.train_async_file_reader_num_threads != 0:
-        train_dataset = AsyncFileDataset(args.train, model_input_vars, args.train_async_file_reader_num_threads)
+        if args.train is not None:
+            train_dataset = AsyncStdinDataset(model_input_vars, args.train_async_file_reader_num_threads)
+        else:
+            train_dataset = AsyncFileDataset(args.train, model_input_vars, args.train_async_file_reader_num_threads)
     else:
-        train_dataset = FileDataset(args.train, model_input_vars)
+        if args.train is not None:
+            train_dataset = StdinDataset(model_input_vars)
+        else:
+            train_dataset = FileDataset(args.train, model_input_vars)
     print "reading validation"
     if args.test is not None:
         if args.keep_validation_in_memory:
@@ -2000,8 +2049,7 @@ def apply_model_to_data():
     parser.add_argument("-m", "--model_path", required=True)
     parser.add_argument("-o", "--output", default=None,
         help="Which variable to output")
-    parser.add_argument('-d', "--data", required=True,
-        help="path to the dataset file")
+    parser.add_argument('-d', "--data", help="path to the dataset file. If not specified - read from stdin", default=None)
     parser.add_argument('-i', "--inputs", help="csv inputs names")
     parser.add_argument('-f', "--output_file", help="file where to put the result", required=True)
     parser.add_argument("--aff", dest="async_file_reader_num_threads",
@@ -2029,7 +2077,11 @@ def apply_model_to_data():
             inputs.append(model_inputs[input])
         else:
             inputs.append(Variable(type=None, name="input"))
-    dataset = AsyncFileDataset(args.data, inputs, num_threads=3)
+
+    if args.data is not None:
+        dataset = AsyncFileDataset(args.data, inputs, num_threads=3)
+    else:
+        dataset = AsyncStdinDataset(inputs, num_threads=3)
     with open(args.output_file, "w") as of:
         apply_model(model, dataset, of)
 
