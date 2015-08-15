@@ -1815,7 +1815,7 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
     else:
         file_ = sys.stdin
     for line in file_:
-        for idx, line in enumerate(sys.stdin):
+        for idx, line in enumerate(file_):
             if idx % 10000 == 0:
                 sys.stdout.write("\rreading sample {}".format(idx))
                 sys.stdout.flush()
