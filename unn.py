@@ -292,6 +292,7 @@ class Trainer(object):
                 have_new_transformers = True
                 break
         if have_new_transformers:
+            # breaks streaming
             print "Fitting transformers"
             for num_samples, data_map in train_dataset.read(1000000):
                 for var_name, var in input_vars.items():
@@ -389,7 +390,6 @@ class Trainer(object):
                 theano_inputs=validation_inputs,
                 outputs=[validation_loss])
 
-        print "Estimating initial performance"
         if validation_energy is not None:
             # compute validation score
             best_validation_score = 0
@@ -402,20 +402,8 @@ class Trainer(object):
 
             print "Initial validation score: {}".format(best_validation_score)
 
-        # estimate training score
-        train_score = 0
-        samples_total = 0
-        for batch_idx, (num_samples, data_map) in enumerate(train_dataset.read(10000)):
-            batch_score = score_train(data_map)[0]
-            samples_total += num_samples
-            train_score += num_samples * batch_score
-            if batch_idx > 10:
-                break
-        train_score *= 1.0 / samples_total
-
         print "Learning"
         # training
-        train_decay = 0.999
         batch_idx = 0
         epoch_ind = 0
 
@@ -423,6 +411,8 @@ class Trainer(object):
             interrupts_budget = 10
         data_iter = train_dataset.read_train(self.batch_size)
         start_time = time.time()
+        num_start_samples = 0
+        train_score = 0
         while True:
             try:
                 while epoch_ind < self.num_epochs:
@@ -434,6 +424,12 @@ class Trainer(object):
                                 sys.stdout.flush()
                             continue
                         batch_score = train(data_map)[0]
+                        if num_start_samples > 100000:
+                            train_decay = 0.999
+                        else:
+                            num_start_samples += num_samples
+                            x = math.log(0.01) * (1 - num_start_samples / 100000.0) + math.log(0.999 / 0.001) * num_start_samples / 100000.0
+                            train_decay = 1.0 / (1.0 + math.exp(-x))
                         train_score = train_decay * train_score + (1 - train_decay) * batch_score
 
                         if (batch_idx + 1) % 100 == 0:
@@ -461,7 +457,11 @@ class Trainer(object):
                                     epoch_ind, validation_score, best_validation_score, "model saved" if model_saved else ""))
                             else:
                                 model.save(save_path)
-                    data_iter = train_dataset.read_train(self.batch_size)
+                    if train_dataset.is_one_pass:
+                        print "All train samples were consumed"
+                        epoch_ind = self.num_epochs
+                    else:
+                        data_iter = train_dataset.read_train(self.batch_size)
                     epoch_ind += 1
                 break
             except KeyboardInterrupt:
@@ -1421,6 +1421,8 @@ class DenseMatrixBuilder(object):
         self.dtype = dtype
         self.pos = 0
     def append_row(self, str_):
+        if self.pos == self.array.shape[0]:
+            self.array = numpy.concatenate((self.array, numpy.zeros(self.array.shape)))
         self.array[self.pos] = numpy.fromstring(str_, dtype=numpy.float32, sep=" ")
         self.pos += 1
     def get(self):
@@ -1494,6 +1496,8 @@ class Dataset(object):
         raise NotImplementedError()
     def read(self, batch_size):
         raise NotImplementedError()
+    def is_one_pass(self):
+        return False
 
 class MemoryDataset(Dataset):
     def __init__(self, arrays, input_vars, use_random_iterator):
@@ -1558,6 +1562,8 @@ def prepare_batch(input_vars, lines):
 
     for idx, line in enumerate(lines):
         entries = line.strip("\n").split("\t")
+        if len(entries) != len(arrays):
+            raise Exception("Number of entries in input file '" + str(len(entries)) + "' is not equal to the number of inputs: " + str(len(arrays)))
         for input_idx, entry in enumerate(entries):
             if arrays[input_idx] is not None:
                 arrays[input_idx].append_row(entry)
@@ -1566,10 +1572,10 @@ def prepare_batch(input_vars, lines):
         if data is not None:
             res[var.name] = data.get()
     return (len(lines), res)
-class AsyncFileIterator(object):
+class AsyncStreamIterator(object):
     def __init__(self, input_file, input_vars, batch_size, num_threads=1):
-        self.init(input_file, input_vars, batch_size)
         self.workers = concurrent.futures.ProcessPoolExecutor(num_threads)
+        self.init(input_file, input_vars, batch_size)
     def init(self, input_file, input_vars, batch_size):
         self.input_file = input_file
         self.input_vars = input_vars
@@ -1672,17 +1678,16 @@ class AsyncFileDataset(Dataset):
     def read_train(self, batch_size):
         # only one iterator may be active
         if self.iter is not None:
-            self.iter.reset(self.input_file, self.input_vars, batch_size)
+            self.iter.reset(open(self.input_file), self.input_vars, batch_size)
         else:
-            self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
+            self.iter = AsyncStreamIterator(open(self.input_file), self.input_vars, batch_size, self.num_threads)
         return self.iter
     def read(self, batch_size):
         # only one iterator may be active
         if self.iter is not None:
-            self.iter.reset(self.input_file, self.input_vars, batch_size)
+            self.iter.reset(open(self.input_file), self.input_vars, batch_size)
         else:
-            self.iter = AsyncFileIterator(self.input_file, self.input_vars, batch_size, self.num_threads)
-        return self.iter
+            self.iter = AsyncStreamIterator(open(self.input_file), self.input_vars, batch_size, self.num_threads)
 
 class AsyncStdinDataset(Dataset):
     def __init__(self, input_vars, num_threads=1):
@@ -1693,12 +1698,17 @@ class AsyncStdinDataset(Dataset):
     def read_train(self, batch_size):
         # only one iterator may be active
         assert self.iter is None
-        self.iter = AsyncFileIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
+        assert not sys.stdin.isatty()
+        self.iter = AsyncStreamIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
         return self.iter
     def read(self, batch_size):
         assert self.iter is None
-        self.iter = AsyncFileIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
+        assert not sys.stdin.isatty()
+        self.iter = AsyncStreamIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
         return self.iter
+        return self.iter
+    def is_one_pass(self):
+        return True
 
 
 class FileDataset(Dataset):
@@ -1714,9 +1724,14 @@ class StdinDataset(Dataset):
     def __init__(self, input_vars):
         self.input_vars = input_vars
     def read_train(self, batch_size):
+        assert not sys.stdin.isatty()
         return FileIterator(sys.stdin, self.input_vars, batch_size)
     def read(self, batch_size):
+        assert not sys.stdin.isatty()
         return FileIterator(sys.stdin, self.input_vars, batch_size)
+        return self.iter
+    def is_one_pass(self):
+        return True
 
 
 def get_transformer(transformer_name):
@@ -1855,7 +1870,7 @@ def learn():
     parser.add_argument("--mt", dest="keep_validation_in_memory", help="read validation data from memory", action="store_const", const=True, default=False)
     parser.add_argument("--aft", dest="test_async_file_reader_num_threads",
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
-    parser.add_argument('-i', "--inputs",
+    parser.add_argument('-i', "--inputs", required=True,
         help="Inputs names. Format: <name>[:<type>:<num_features>]@<preprocessor>,<name>[:<type>:<num_features>]@<preprocessor>. "
             "Entry 'num_features' is optional for dense input. Entries 'type', 'num_features' for dense input are optional - they will be inferred from "
             "the data (if train file is specified). Entry 'preprocessor' (valid options: pca, scale, minmax, none. Default - none) is valid only for dense input")
@@ -1899,7 +1914,7 @@ def learn():
     if args.val_energy is None:
         args.val_energy = args.train_energy
 
-    if not args.train is not None and not os.path.exists(args.train):
+    if args.train is not None and not os.path.exists(args.train):
         raise Exception("Train file is missing")
     if args.test is None:
         print "Warning: no validation. The model will be saved each {} batches".format(args.val_freq)
@@ -1909,9 +1924,11 @@ def learn():
     args.inputs = "".join(args.inputs.split())
     args.architecture = "".join(args.architecture.split())
     if args.train is not None:
-        model_input_vars = get_input_vars(args.inputs)
-    else:
         model_input_vars = get_input_vars(args.inputs, args.train)
+    else:
+        if sys.stdin.isatty():
+            raise Exception("Train dataset is supposed to come from stdin, but stdin is empty")
+        model_input_vars = get_input_vars(args.inputs)
 
     print "Loading the model"
     if args.continue_learning:
@@ -1950,14 +1967,14 @@ def learn():
         train_dataset = load_dataset_from_file(args.train, model_input_vars, args.use_random_iterator)
     elif args.train_async_file_reader_num_threads != 0:
         if args.train is not None:
-            train_dataset = AsyncStdinDataset(model_input_vars, args.train_async_file_reader_num_threads)
-        else:
             train_dataset = AsyncFileDataset(args.train, model_input_vars, args.train_async_file_reader_num_threads)
+        else:
+            train_dataset = AsyncStdinDataset(model_input_vars, args.train_async_file_reader_num_threads)
     else:
         if args.train is not None:
-            train_dataset = StdinDataset(model_input_vars)
-        else:
             train_dataset = FileDataset(args.train, model_input_vars)
+        else:
+            train_dataset = StdinDataset(model_input_vars)
     print "reading validation"
     if args.test is not None:
         if args.keep_validation_in_memory:
