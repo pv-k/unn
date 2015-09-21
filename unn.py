@@ -54,9 +54,9 @@ import concurrent.futures
 
 class unique_tempdir(object):
     def __enter__(self):
-        if not (os.path.isdir("./tmp")):
-            os.makedirs("./tmp")
-        self.dir = tempfile.mkdtemp(dir="./tmp/")
+        if not (os.path.isdir("/var/tmp/unn")):
+            os.makedirs("/var/tmp/unn")
+        self.dir = tempfile.mkdtemp(dir="/var/tmp/unn")
         return self.dir
     def __exit__(self, etype, value, traceback):
         shutil.rmtree(self.dir)
@@ -399,7 +399,6 @@ class Trainer(object):
                 samples_total += num_samples
                 best_validation_score += num_samples * batch_score
             best_validation_score *= 1.0 / samples_total
-
             print "Initial validation score: {}".format(best_validation_score)
 
         print "Learning"
@@ -457,7 +456,7 @@ class Trainer(object):
                                     epoch_ind, validation_score, best_validation_score, "model saved" if model_saved else ""))
                             else:
                                 model.save(save_path)
-                    if train_dataset.is_one_pass:
+                    if train_dataset.is_one_pass():
                         print "All train samples were consumed"
                         epoch_ind = self.num_epochs
                     else:
@@ -893,6 +892,44 @@ def unit_norm(rng, *inputs):
     return [UnitNormModule(inputs[0])]
 register_module("unit_norm", unit_norm)
 
+class GroupUnitNormModule(Module):
+    def __init__(self, input, num_inputs, group_size):
+        self.num_inputs = num_inputs
+        self.group_size = group_size
+        Module.__init__(self, [input], Variable(input.type, input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        input = inputs[0]
+        start_idx = 0
+        finish_idx = start_idx + self.group_size
+        out = T.zeros_like(input)
+        while finish_idx < self.num_inputs:
+            input_slice = input[:, start_idx:finish_idx]
+            out = T.set_subtensor(out[:, start_idx:finish_idx], input_slice / (numpy.float32(1e-10) + T.sqrt(T.sum(input_slice * input_slice, axis=1)).dimshuffle((0, 'x'))))
+            start_idx += self.group_size
+            finish_idx = start_idx + self.group_size
+        return out, [], []
+def group_unit_norm(rng, *inputs):
+    if len(inputs) < 2 or len(inputs) > 3:
+        raise Exception("Invalid number of inputs to group_unit_norm function")
+    var = inputs[0]
+    num_inputs = inputs[1]
+    try:
+        num_inputs = int(num_inputs)
+    except TypeError:
+        raise Exception("Cannot convert num_inputs to int in group_unit_norm: " + group_size)
+    group_size = 10 if len(inputs) == 1 else inputs[2]
+    try:
+        group_size = int(group_size)
+    except TypeError:
+        raise Exception("Cannot confert group_size toint  in group_unit_norm: " + group_size)
+    if num_inputs % group_size != 0:
+        raise Exception("Group size should divide num_inputs in group_unit_norm")
+    if not isinstance(inputs[0], Variable):
+        raise Exception("Unknown input: " + str(input))
+    return [GroupUnitNormModule(var, num_inputs, group_size)]
+register_module("group_unit_norm", group_unit_norm)
+
 class SubModule(Module):
     def __init__(self, inputs):
         num_output_features = 1
@@ -1199,6 +1236,9 @@ class Unn(object):
                 try:
                     with open(tmp_model_path, "w") as f:
                         pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
+                    # check if the model can be loaded
+                    with open(tmp_model_path) as f:
+                        pickle.load(f)
                     for _ in range(10):
                         try:
                             shutil.move(tmp_model_path, path)
@@ -1210,9 +1250,8 @@ class Unn(object):
                         pickle.load(f)
                     break
                 except Exception as ex:
-                    sys.stderr.write("Saving failed: " + str(ex))
+                    sys.stderr.write("Save failed: " + str(ex) + "\n")
                     time.sleep(1)
-                    pass
         sys.stdout.write("Model saved\n")
 
 
@@ -1416,13 +1455,12 @@ class SparseMatrixBuilder(object):
 
 
 class DenseMatrixBuilder(object):
-    def __init__(self, num_features, num_samples, dtype=numpy.float32):
-        self.array = numpy.zeros([num_samples, num_features], dtype=dtype)
-        self.dtype = dtype
+    def __init__(self, num_features, num_samples):
+        self.array = numpy.zeros([num_samples, num_features], dtype=numpy.float32)
         self.pos = 0
     def append_row(self, str_):
         if self.pos == self.array.shape[0]:
-            self.array = numpy.concatenate((self.array, numpy.zeros(self.array.shape)))
+            self.array = numpy.concatenate((self.array, numpy.zeros(self.array.shape, dtype=numpy.float32)))
         self.array[self.pos] = numpy.fromstring(str_, dtype=numpy.float32, sep=" ")
         self.pos += 1
     def get(self):
@@ -1499,6 +1537,7 @@ class Dataset(object):
     def is_one_pass(self):
         return False
 
+
 class MemoryDataset(Dataset):
     def __init__(self, arrays, input_vars, use_random_iterator):
         self.arrays = arrays
@@ -1511,6 +1550,8 @@ class MemoryDataset(Dataset):
             return SequentialDatasetIterator(self, batch_size)
     def read(self, batch_size):
         return SequentialDatasetIterator(self, batch_size)
+    def is_one_pass(self):
+        return False
 
 
 class FileIterator(object):
@@ -1754,7 +1795,7 @@ def get_input_vars(inputs_specification, dataset_file=None):
     for spec in inputs_specs:
         entries = spec.split("@")[0].split(":")
         if len(entries) > 3:
-            raise Exception("Wrong number of fields in input specification: {}. Should be: name[:type:num_features@transformer]".format(spec))
+            raise Exception("Wrong number of fields in input specification: {}. Should be: name:type:num_features[@transformer]".format(spec))
         if dataset_file is None and len(entries) != 3:
             raise Exception("Wrong number of fields in input specification: {}. Should be: name:type:num_features[@transformer]".format(spec))
         name = entries[0]
@@ -1797,13 +1838,12 @@ def get_input_vars(inputs_specification, dataset_file=None):
                             input_var.name, len(items.split(" ")), input_var.num_features))
                     input_var.num_features = len(item.split(" "))
 
-    for idx, var in enumerate(input_vars):
-        if "@" in inputs_specs[idx]:
+    for spec,var in zip(inputs_specs, input_vars):
+        if "@" in spec:
             entries = spec.split("@")
             if len(entries) != 2:
                 raise Exception("Invalid input specification: multiple @ found for input {}".format(spec))
             transform_name = entries[-1]
-            spec = entries[0]
         else:
             if var.type == "dense":
                 # was scale, changed to none so that targets or weights were not accidentaly scaled
@@ -2046,7 +2086,10 @@ def add_new_modules():
         sys.stderr.write("Cannot load the model: {}".format(ex))
         raise
 
-    new_inputs = get_input_vars(args.inputs)
+    if args.inputs != None:
+        new_inputs = get_input_vars(args.inputs)
+    else:
+        new_inputs = []
     model_input_vars = unn.inputs
     model_inputs = set()
     for input in model_input_vars:
