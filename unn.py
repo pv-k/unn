@@ -27,6 +27,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."""
 import argparse
 import sys
 import pickle
+import cloudpickle
 import os.path
 import math
 
@@ -49,6 +50,7 @@ import theano.tensor as T
 import theano.tensor.nnet
 from theano.compile.ops import as_op
 import sklearn.preprocessing
+import sklearn.decomposition
 import signal
 import concurrent.futures
 
@@ -342,28 +344,16 @@ class Trainer(object):
                 momentum = None
             learning_rates = [lr] * len(params)
             momentums = [momentum] * len(params)
-            if self.optimizer == "nesterov":
-                train = Function(
-                    input_transformers=transformers_map,
-                    theano_inputs=input_theano_vars,
-                    outputs=[train_loss],
-                    updates=sgd_update(
-                        energy=train_loss,
-                        params=params,
-                        learning_rates=learning_rates,
-                        momentums=momentums,
-                        nesterov=True))
-            else:
-                train = Function(
-                    input_transformers=transformers_map,
-                    theano_inputs=input_theano_vars,
-                    outputs=[train_loss],
-                    updates=sgd_update(
-                        energy=train_loss,
-                        params=params,
-                        learning_rates=learning_rates,
-                        momentums=momentums,
-                        nesterov=False))
+            train = Function(
+                input_transformers=transformers_map,
+                theano_inputs=input_theano_vars,
+                outputs=[train_loss],
+                updates=sgd_update(
+                    energy=train_loss,
+                    params=params,
+                    learning_rates=learning_rates,
+                    momentums=momentums,
+                    nesterov=self.optimizer == "nesterov"))
         elif self.optimizer == "adadelta":
             train = Function(
                 input_transformers=transformers_map,
@@ -475,7 +465,7 @@ class Trainer(object):
 
 # ------------------------------apply---------------------------------------
 
-def apply_model(model, dataset, output_stream):
+def get_applier(model):
     input_vars = {var.name: var for var in flatten(model.get_inputs())}
     transformers_map = {var.name: var.transformer for var in input_vars.values() if
         var.transformer is not None}
@@ -493,14 +483,19 @@ def apply_model(model, dataset, output_stream):
         flatten(model.get_inputs())], model.get_inputs())
     model_output = model.fprop(inputs)
 
-    eval_data = Function(
+    eval_func = Function(
         input_transformers=transformers_map,
         theano_inputs=input_theano_vars,
         outputs=[model_output])
 
+    return eval_func
+
+def apply_model(model, dataset, output_stream):
+    apply_ = get_applier(model)
     for batch_idx, (num_samples, data_map) in enumerate(dataset.read(10000)):
-        output = eval_data(data_map)[0]
+        output = apply_(data_map)[0]
         output_stream.write("\n".join(("\t".join(str(val) for val in vals)) for vals in output) + "\n")
+
 
 # -----------------------------------modules-----------------------
 modules_map = {}
@@ -527,6 +522,10 @@ class Module(object):
     # the parameters that are not persistent (exist only during function execution).
     # As can be seen in sgd_update, we may still want to know their values
     def train_fprop(self, inputs):
+        raise NotImplementedError()
+    # dump parameters and archetecture to use somewhere else
+    def dump_fprop(self):
+        sys.stderr.write("Error: no dump_fprop in " + str(self.__class__.__name__))
         raise NotImplementedError()
     def fprop(self, inputs):
         return self.train_fprop(inputs)[0]
@@ -598,6 +597,9 @@ class AffineModule(Module):
         self.W = theano.shared(value=W_values, name="W")
         b_values = numpy.zeros((1, num_outputs), dtype=numpy.float32)
         self.b = theano.shared(value=b_values, name="b", broadcastable=(True, False))
+    def dump_fprop(self):
+        return ["affine", [self.W.get_value(), self.b.get_value()],
+            [id(var) for var in self.get_inputs()], id(self.get_output())]
     def train_fprop(self, inputs):
         assert len(inputs) == 1
         input = inputs[0]
@@ -648,6 +650,8 @@ class RluModule(Module):
         assert len(inputs) == 1
         var = inputs[0]
         return var * (var > 0), [], []
+    def dump_fprop(self):
+        return ["rlu", [], [id(var) for var in self.get_inputs()], id(self.get_output())]
 def rlu(rng, input_variable, num_outputs=None):
     modules = []
     if not isinstance(input_variable, Variable):
@@ -680,6 +684,26 @@ def sigmoid(rng, input_variable, num_outputs=None):
     modules.append(SigmoidModule(input_variable))
     return modules
 register_module("sigmoid", sigmoid)
+
+class SoftmaxModule(Module):
+    def __init__(self, input):
+        Module.__init__(self, [input], Variable("dense", input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        var = inputs[0]
+        return T.nnet.softmax(var), [], []
+def softmax(rng, input_variable, num_outputs=None):
+    modules = []
+    if not isinstance(input_variable, Variable):
+        raise Exception("Unknown input: " + str(input_variable))
+    if num_outputs is not None:
+        num_outputs = int(num_outputs)
+        modules.append(AffineModule(rng, input_variable,
+            num_outputs, "softmax"))
+        input_variable = modules[-1].get_output()
+    modules.append(SoftmaxModule(input_variable))
+    return modules
+register_module("softmax", softmax)
 
 class ExpModule(Module):
     def __init__(self, input):
@@ -917,7 +941,7 @@ def group_unit_norm(rng, *inputs):
     try:
         num_inputs = int(num_inputs)
     except TypeError:
-        raise Exception("Cannot convert num_inputs to int in group_unit_norm: " + group_size)
+        raise Exception("Cannot convert num_inputs to int in group_unit_norm: " + num_inputs)
     group_size = 10 if len(inputs) == 1 else inputs[2]
     try:
         group_size = int(group_size)
@@ -1068,6 +1092,130 @@ def cross_entropy(rng, predictions, targets, weights=None):
     return [CrossEntropy(predictions, targets, weights)]
 register_module("cross_entropy", cross_entropy)
 
+class GroupUnitNormModule(Module):
+    def __init__(self, input, num_inputs, group_size):
+        self.num_inputs = num_inputs
+        self.group_size = group_size
+        Module.__init__(self, [input], Variable(input.type, input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        input = inputs[0]
+        start_idx = 0
+        finish_idx = start_idx + self.group_size
+        out = T.zeros_like(input)
+        while finish_idx < self.num_inputs:
+            input_slice = input[:, start_idx:finish_idx]
+            out = T.set_subtensor(out[:, start_idx:finish_idx], input_slice / (numpy.float32(1e-10) + T.sqrt(T.sum(input_slice * input_slice, axis=1)).dimshuffle((0, 'x'))))
+            start_idx += self.group_size
+            finish_idx = start_idx + self.group_size
+        return out, [], []
+
+class DropoutModule(Module):
+    def __init__(self, input, p, rng):
+        self.p = p
+        self.rng = rng
+        Module.__init__(self, [input], Variable(input.type, input.num_features, self))
+    def train_fprop(self, inputs):
+        assert len(inputs) == 1
+        rng = theano.tensor.shared_randomstreams.RandomStreams(self.rng.randint(1000000000))
+        mask = rng.binomial(n=1, p=1 - self.p, size=inputs[0].shape)
+        output = inputs[0] * T.cast(mask, "float32")
+        return output, [], []
+    def fprop(self, inputs):
+        return (1 - self.p) * inputs[0]
+    def dump_fprop(self):
+        return ["dropout", [self.p], [id(var) for var in self.get_inputs()], id(self.get_output())]
+        raise NotImplementedError()
+def dropout(rng, input, pdrop):
+    if not isinstance(input, Variable):
+        raise Exception("Unknown input (input in mse): " + str(input))
+    try:
+        pdrop = float(pdrop)
+    except ValueError:
+        raise Exception("Bad input (pdrop in mse): " + str(pdrop))
+    return [DropoutModule(input, pdrop, rng)]
+register_module("dropout", dropout)
+
+class RankNetModule(Module):
+    def __init__(self, predictions, targets):
+        inputs = [predictions, targets]
+        assert predictions.num_features is not None
+        self.num_features = predictions.num_features
+        Module.__init__(self, inputs, Variable("dense", 1, self))
+    def train_fprop(self, inputs):
+        predictions = inputs[0]
+        targets = inputs[1]
+        new_predictions = T.cast(T.alloc(0, targets.shape[0], self.num_features * self.num_features), "float32")
+        new_weights = T.cast(T.alloc(0, targets.shape[0], self.num_features * self.num_features), "float32")
+        new_targets = T.cast(T.alloc(0, targets.shape[0], self.num_features * self.num_features), "float32")
+        # idx = 0
+        # for src in range(self.num_features):
+        #     for dst in range(self.num_features):
+        #         new_predictions = theano.tensor.set_subtensor(new_predictions[:, idx], predictions[:, src] - predictions[:, dst])
+        #         new_weights = theano.tensor.set_subtensor(new_weights[:, idx], targets[:, src] - targets[:, dst])
+        #         new_targets = theano.tensor.set_subtensor(new_targets[:, idx], targets[:, src] > targets[:, dst])
+        #         idx += 1
+        idx = 0
+        for src in range(self.num_features):
+            new_predictions = theano.tensor.inc_subtensor(
+                new_predictions[:, idx: idx + self.num_features],
+                predictions[:, src].dimshuffle(0, 'x') - predictions)
+            new_weights = theano.tensor.inc_subtensor(
+                new_weights[:, idx:idx + self.num_features],
+                targets[:, src].dimshuffle(0, 'x') - targets)
+            new_targets = theano.tensor.inc_subtensor(
+                new_targets[:, idx:idx + self.num_features],
+                T.cast(targets < targets[:, src].dimshuffle(0, 'x'), "float32"))
+            idx += self.num_features
+        new_predictions = T.nnet.sigmoid(new_predictions)
+        new_weights *= new_weights > 0
+        return -T.sum(new_weights * (new_targets * T.log(new_predictions + numpy.float32(1e-10)) + \
+            (numpy.float32(1) - new_targets) * T.log(numpy.float32(1.0000001) - new_predictions))) / \
+            targets.shape[0],[],[]
+def ranknet(rng, predictions, targets):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in cross_entropy): " + str(predictions))
+    if not isinstance(targets, Variable):
+        raise Exception("Unknown input (targets in cross_entropy): " + str(targets))
+    return [RankNetModule(predictions, targets)]
+register_module("ranknet", ranknet)
+
+class BBDepth2(Module):
+    def __init__(self, predictions, predictions0, predictions1, predictions2, predictions3):
+        inputs = [predictions, predictions0, predictions1, predictions2, predictions3]
+        assert predictions.num_features is not None
+        self.num_features = predictions.num_features
+        Module.__init__(self, inputs, Variable("dense", 4 * predictions.num_features, self))
+    def train_fprop(self, inputs):
+        p, p0, p1, p2, p3 = inputs
+        p = T.log(T.nnet.softmax(p))
+        p0 = T.log(T.nnet.softmax(p0))
+        p1 = T.log(T.nnet.softmax(p1))
+        p2 = T.log(T.nnet.softmax(p2))
+        p3 = T.log(T.nnet.softmax(p3))
+        output = T.cast(T.alloc(0, p.shape[0], 4 * self.num_features), "float32")
+        output = theano.tensor.set_subtensor(output[:, :self.num_features],
+            p[:, 0].dimshuffle(0, 'x') + p0)
+        output = theano.tensor.set_subtensor(output[:, self.num_features:2 * self.num_features],
+            p[:, 1].dimshuffle(0, 'x') + p1)
+        output = theano.tensor.set_subtensor(output[:, 2 * self.num_features:3 * self.num_features],
+            p[:, 2].dimshuffle(0, 'x') + p2)
+        output = theano.tensor.set_subtensor(output[:, 3 * self.num_features:4 * self.num_features],
+            p[:, 3].dimshuffle(0, 'x') + p3)
+        return output,[],[]
+def bbdepth2(rng, predictions, predictions0, predictions1, predictions2, predictions3):
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions in bbdepth2): " + str(predictions))
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions0 in bbdepth2): " + str(predictions0))
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions1 in bbdepth2): " + str(predictions1))
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions2 in bbdepth2): " + str(predictions2))
+    if not isinstance(predictions, Variable):
+        raise Exception("Unknown input (predictions3 in bbdepth2): " + str(predictions3))
+    return [BBDepth2(predictions, predictions0, predictions1, predictions2, predictions3)]
+register_module("bbdepth2", bbdepth2)
 
 class ErrorRate(Module):
     def __init__(self, predictions, targets, weights=None):
@@ -1108,7 +1256,7 @@ def error_rate(rng, predictions, targets, weights=None):
             raise Exception("Unknown input (targets in error_rate): " + str(targets))
     if weights is not None and not isinstance(weights, Variable):
         raise Exception("Unknown input: " + str(weights))
-    return [Accuracy(predictions, targets, weights)]
+    return [ErrorRate(predictions, targets, weights)]
 register_module("error_rate", error_rate)
 
 
@@ -1149,6 +1297,14 @@ class FuncModule(Module):
         self.toposorted_modules = toposorted_modules
     def get_defined_inputs(self):
         return self.defined_inputs
+    def dump_fprop(self):
+        res = []
+        for module in self.toposorted_modules:
+            if not isinstance(module, FuncModule):
+                res.append(module.dump_fprop())
+            else:
+                res.extend(module.dump_fprop())
+        return res
     def train_fprop(self, inputs):
         assert len(inputs) == len(self.get_inputs())
         context = {}
@@ -1189,6 +1345,22 @@ class UnnComputer(Module):
     def __init__(self, func):
         Module.__init__(self, func.get_inputs(), func.get_output())
         self.func = func
+    def dump_fprop(self):
+        res = []
+        for input_ in self.get_inputs():
+            if input_.transformer is not None:
+                if isinstance(input_.transformer, MyStandardScaler):
+                    res.append(["standard_scaler", [input_.transformer.means, input_.transformer.stds],
+                        [id(input_)], id(input_)])
+                elif isinstance(input_.transformer, sklearn.preprocessing.StandardScaler):
+                    res.append(["standard_scaler", [input_.transformer.mean_, input_.transformer.std_],
+                        [id(input_)], id(input_)])
+                else:
+                    sys.stderr.write("Unsupported transformer: " + str(res.Transformer))
+                    assert False
+        return (res + self.func.dump_fprop(),
+                    {input_.name: id(input_) for input_ in self.get_inputs()},
+                    id(self.get_output()))
     def train_fprop(self, inputs):
         return self.func.train_fprop(inputs)
     def fprop(self, inputs):
@@ -1235,7 +1407,7 @@ class Unn(object):
             for i in range(100):
                 try:
                     with open(tmp_model_path, "w") as f:
-                        pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
+                        cloudpickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
                     # check if the model can be loaded
                     with open(tmp_model_path) as f:
                         pickle.load(f)
@@ -1482,7 +1654,7 @@ class RandomDatasetIterator(object):
         num_samples = dataset.arrays[0].shape[0]
 
         if weights_pos < 0:
-            self.cumsum = range(1,num_samples + 1) * 1.0 / num_samples
+            self.cumsum = numpy.asarray(range(1,num_samples + 1)) * 1.0 / num_samples
         else:
             self.cumsum = numpy.cumsum(abs(dataset.arrays[weights_pos]) * 1.0 / sum(abs(dataset.arrays[weights_pos])))
 
@@ -1729,6 +1901,7 @@ class AsyncFileDataset(Dataset):
             self.iter.reset(open(self.input_file), self.input_vars, batch_size)
         else:
             self.iter = AsyncStreamIterator(open(self.input_file), self.input_vars, batch_size, self.num_threads)
+        return self.iter
 
 class AsyncStdinDataset(Dataset):
     def __init__(self, input_vars, num_threads=1):
@@ -1746,7 +1919,6 @@ class AsyncStdinDataset(Dataset):
         assert self.iter is None
         assert not sys.stdin.isatty()
         self.iter = AsyncStreamIterator(sys.stdin, self.input_vars, batch_size, self.num_threads)
-        return self.iter
         return self.iter
     def is_one_pass(self):
         return True
@@ -1770,7 +1942,6 @@ class StdinDataset(Dataset):
     def read(self, batch_size):
         assert not sys.stdin.isatty()
         return FileIterator(sys.stdin, self.input_vars, batch_size)
-        return self.iter
     def is_one_pass(self):
         return True
 
@@ -1835,7 +2006,7 @@ def get_input_vars(inputs_specification, dataset_file=None):
                     input_var.type = "dense"
                     if input_var.num_features is not None and input_var.num_features != len(item.split(" ")):
                         raise Exception("Number of features mismatch for input {}. Got {}, specified {}".format(
-                            input_var.name, len(items.split(" ")), input_var.num_features))
+                            input_var.name, len(item.split(" ")), input_var.num_features))
                     input_var.num_features = len(item.split(" "))
 
     for spec,var in zip(inputs_specs, input_vars):
@@ -1878,7 +2049,7 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
             if len(entries) != len(arrays):
                 print "idx=" + str(idx)
                 print "num_entries="+ str(len(entries))
-                raise Exception("Wrong number of inputs in " + file_)
+                raise Exception("Wrong number of inputs in input file")
 
             for builder, entry in zip(arrays, entries):
                 builder.append_row(entry)
@@ -1890,6 +2061,14 @@ def load_dataset_from_file(file_, input_vars, use_random_iterator=False):
 
 #--------------------------------modes-----------------------------------
 
+def load_model(path):
+    try:
+        with open(path) as f:
+            return pickle.load(f)
+        print "Model was loaded from path " + path
+    except Exception as ex:
+        sys.stderr.write("Cannot load the model: {}".format(ex))
+        raise
 
 class Object(object):
     pass
@@ -1901,12 +2080,12 @@ def learn():
 
     # data specification
     parser.add_argument('-f', "--train", default=None,
-        help="path to the learn dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...]). If not specfied - read from stdin")
+        help="path to the learn dataset (format: space-separated_input [\\t space-separated_input ...]). If not specfied - read from stdin")
     parser.add_argument("--mf", dest="keep_train_in_memory", help="read train data from memory", action="store_const", const=True, default=False)
     parser.add_argument("--aff", dest="train_async_file_reader_num_threads",
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
     parser.add_argument('-t', "--test",
-        help="path to the validation dataset (format: target \\t weight \\t space-separated_input [\\t space-separated_input ...])")
+        help="path to the validation dataset (format: space-separated_input [\\t space-separated_input ...])")
     parser.add_argument("--mt", dest="keep_validation_in_memory", help="read validation data from memory", action="store_const", const=True, default=False)
     parser.add_argument("--aft", dest="test_async_file_reader_num_threads",
         help="Experimental option: read data from file asyncroniously using this number of threads", type=int, default=0)
@@ -1972,14 +2151,7 @@ def learn():
 
     print "Loading the model"
     if args.continue_learning:
-        assert os.path.exists(args.model_path)
-        try:
-            with open(args.model_path) as f:
-                unn = pickle.load(f)
-            print "Model was loaded from path " + args.model_path
-        except Exception as ex:
-            sys.stderr.write("Cannot load the model: {}".format(ex))
-            raise
+        unn = load_model(args.model_path)
         unn_inputs = {}
         for input in unn.inputs:
             unn_inputs[input.name] = input
@@ -1997,7 +2169,7 @@ def learn():
         raise Exception("Train energy variable is unknown")
     if args.test is not None:
         if args.val_energy not in unn.funcs:
-            raise Exception("Train energy variable is unknown")
+            raise Exception("Test energy variable is unknown")
     # if unn is large, it may cause MemoryError while forking
     del unn
 
@@ -2177,6 +2349,28 @@ def print_help():
     print "\tunn.py add ... - add new operations to the architecture"
 
 
+class MyStandardScaler():
+    def __init__(self, means, stds):
+        self.means = means
+        self.stds = stds
+    def transform(self, data):
+        return (data - self.means) / self.stds
+
+# scipy broke compatibility between versions, fix it
+def up():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--m1", required=True)
+    parser.add_argument("--m2", required=True)
+    args = parser.parse_args()
+    with open(args.m1) as f:
+        unn = pickle.load(f)
+    for input_ in unn.inputs:
+        if input_.transformer is not None and isinstance(input_.transformer, sklearn.preprocessing.StandardScaler):
+            input_.transformer = MyStandardScaler(input_.transformer.mean_, input_.transformer.std_)
+    with open(args.m2, "w") as f:
+        cloudpickle.dump(unn, f, pickle.HIGHEST_PROTOCOL)
+
+
 def dispatch():
     if len(sys.argv) == 1 or len(sys.argv) == 2 and sys.argv[1] == "-h":
         print_help()
@@ -2193,6 +2387,8 @@ def dispatch():
             describe_model()
         elif mode == "add":
             add_new_modules()
+        elif mode == "up":
+            up()
         else:
             print "Unknown mode: {}".format(mode)
             print_help()

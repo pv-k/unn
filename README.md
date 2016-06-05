@@ -67,4 +67,4 @@ Some of the implemented operations are (see the source code for more information
 Most mathematical issues are resolved with theano, thus it is very easy to introduce a new operation if it is missing.
 
 ##Installation
-Currently it is just one file, so you can just copy it and put wherever you want. It requires theano, numpy and scipy. It is highly recommended that the libraries were configured to use optimized blas libraries, like openblas or mkl. Otherwise you may get a 10x slowdown.
+Currently it is just one file, so you can just copy it and put wherever you want. It requires theano, numpy, scipy and cloudpickle. It is highly recommended that the libraries were configured to use optimized blas libraries, like openblas or mkl. Otherwise you may get a 10x slowdown.
